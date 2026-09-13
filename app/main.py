@@ -1,7 +1,6 @@
 import sys
 from pathlib import Path
 
-# Гарантируем, что Python видит все модули в текущей папке и подпапках
 BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
@@ -16,6 +15,12 @@ from database import Database
 from bot import TelegramBot
 from sip_worker import SIPWorker
 
+# Пытаемся импортировать голосовой движок, если он у тебя вынесен отдельно
+try:
+    from voice_engine import VoiceEngine
+except ImportError:
+    VoiceEngine = None
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
@@ -29,7 +34,6 @@ async def health_check():
     return {"status": "ok", "service": "WOLTRON Voice AI"}
 
 async def run_fastapi():
-    # Безопасно получаем PORT из любого вида config.py
     config_obj = getattr(config, 'config', getattr(config, 'Config', config))
     port = getattr(config_obj, 'PORT', 8000)
     server_config = uvicorn.Config(app=app, host="0.0.0.0", port=port, log_level="info")
@@ -39,20 +43,26 @@ async def run_fastapi():
 async def main():
     logger.info("Starting WOLTRON Voice AI System...")
    
+    # 1. База данных уже нормально инициализируется сама!
     db = Database()
-   
-    # Автоматически вызываем нужный метод инициализации БД, если он есть
-    for method_name in ['init_db', 'init', 'create_tables', 'connect']:
-        if hasattr(db, method_name):
-            method = getattr(db, method_name)
-            if asyncio.iscoroutinefunction(method):
-                await method()
-            else:
-                method()
-            break
 
-    sip_worker = SIPWorker()
-    bot = TelegramBot(sip_worker)
+    # 2. Создаем VoiceEngine (если есть отдельный класс)
+    voice_engine = VoiceEngine() if VoiceEngine else None
+
+    # 3. Передаем в SIPWorker аргументы, которые он требует
+    try:
+        sip_worker = SIPWorker(voice_engine, db, config)
+    except TypeError:
+        try:
+            sip_worker = SIPWorker(database=db, config=config)
+        except TypeError:
+            sip_worker = SIPWorker(db)
+
+    # 4. Передаем в TelegramBot требуемые зависимости
+    try:
+        bot = TelegramBot(sip_worker, db)
+    except TypeError:
+        bot = TelegramBot(sip_worker)
 
     await asyncio.gather(
         run_fastapi(),
