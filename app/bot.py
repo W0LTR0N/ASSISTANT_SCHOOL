@@ -5,7 +5,6 @@ import re
 from typing import Optional
 
 import aiohttp
-from aiosocksy import connect_tcp
 from aiosocksy.connector import ProxyConnector, ProxyType
 
 from aiogram import Bot, Dispatcher, types
@@ -138,7 +137,7 @@ class TelegramBot:
 
     async def _cmd_start(self, message: types.Message):
         await message.answer(
-            "🤖 <b>WOLTRON Voice AI</b>\n\n"
+            " <b>WOLTRON Voice AI</b>\n\n"
             "Команды:\n"
             "/call <номер> — initiate outbound call\n"
             "/terminate <call_id> — terminate active call\n"
@@ -176,7 +175,7 @@ class TelegramBot:
                 await message.answer("❌ <b>Не удалось инициировать звонок</b>")
         except Exception as e:
             logger.error("Error initiating call: %s", e)
-            await message.answer(" Произошла ошибка")
+            await message.answer("❌ Произошла ошибка")
 
     async def _cmd_terminate(self, message: types.Message):
         if not self._is_admin(message.from_user.id):
@@ -197,7 +196,7 @@ class TelegramBot:
                 await message.answer(f"❌ <b>Не удалось завершить звонок {call_id}</b>")
         except Exception as e:
             logger.error("Error terminating call: %s", e)
-            await message.answer("❌ Произошла ошибка")
+            await message.answer(" Произошла ошибка")
 
     async def _cmd_status(self, message: types.Message):
         if not self._is_admin(message.from_user.id):
@@ -209,7 +208,7 @@ class TelegramBot:
             await message.answer("📊 <b>Нет активных звонков</b>")
             return
 
-        lines = ["📊 <b>Активные звонки:</b>\n"]
+        lines = [" <b>Активные звонки:</b>\n"]
         for call_id, session in active_calls.items():
             phone = session.get("phone", "Unknown")
             state = session.get("state", "Unknown")
