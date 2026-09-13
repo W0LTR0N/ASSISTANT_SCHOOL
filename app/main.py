@@ -1,17 +1,23 @@
 """Точка входа приложения WOLTRON Voice AI."""
 
+"""Точка входа приложения WOLTRON Voice AI."""
+
 import asyncio
 import logging
 import signal
 import sys
 
-from app.sip_worker import SIPWorker
-from app.voice import VoiceEngine
-from app.integrations import Integrations
-from app.database import Database
 from app.agent import Agent
 from app.bot import TelegramBot
-from config import validate_config, TELEGRAM_BOT_TOKEN, DELIVERY_RETRY_INTERVAL
+from app.database import Database
+from app.integrations import Integrations
+from app.sip_worker import SIPWorker
+from app.voice import VoiceEngine
+from config import (
+    DELIVERY_RETRY_INTERVAL,
+    TELEGRAM_BOT_TOKEN,
+    validate_config,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,37 +25,67 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
+async def safe_telegram_runner(
+    telegram_bot: TelegramBot, shutdown_event: asyncio.Event
+):
+    """Фоновый ранер для Телеграм-бота с авто-переподключением без падения всего сервера."""
+    while not shutdown_event.is_set():
+        try:
+            await telegram_bot.start()
+        except Exception as e:
+            if shutdown_event.is_set():
+                break
+            logger.error(
+                "Telegram bot connection failed: %s. Retrying in 5 seconds...",
+                e,
+            )
+            await asyncio.sleep(5)
 
-async def delivery_retry_worker(database: Database, integrations: Integrations):
+async def delivery_retry_worker(
+    database: Database, integrations: Integrations, shutdown_event: asyncio.Event
+):
     """Periodic retry для failed deliveries."""
-    while True:
+    while not shutdown_event.is_set():
         try:
             pending = await database.get_pending_deliveries(limit=10)
             for item in pending:
                 call_id = item["call_id"]
                 try:
                     from app.models import CallResult
+
                     result = CallResult.from_json(item["result"])
-                    
+
                     if item["albato_status"] == "pending":
-                        albato_ok = await integrations.send_to_albato(result.to_dict())
+                        albato_ok = await integrations.send_to_albato(
+                            result.to_dict()
+                        )
                         await database.update_delivery_status(
                             call_id,
                             albato_status="sent" if albato_ok else "pending",
                         )
-                    
+
                     if item["telegram_status"] == "pending":
-                        telegram_ok = await integrations.send_telegram_result(result)
+                        telegram_ok = await integrations.send_telegram_result(
+                            result
+                        )
                         await database.update_delivery_status(
                             call_id,
-                            telegram_status="sent" if telegram_ok else "pending",
+                            telegram_status="sent"
+                            if telegram_ok else "pending",
                         )
                 except Exception as e:
-                    logger.error("Delivery retry error call_id=%s: %s", call_id, e)
+                    logger.error(
+                        "Delivery retry error call_id=%s: %s", call_id, e
+                    )
         except Exception as e:
             logger.error("Delivery retry worker error: %s", e)
-        await asyncio.sleep(DELIVERY_RETRY_INTERVAL)
 
+        try:
+            await asyncio.wait_for(
+                shutdown_event.wait(), timeout=DELIVERY_RETRY_INTERVAL
+            )
+        except asyncio.TimeoutError:
+            pass
 
 async def main():
     logger.info("Starting WOLTRON Voice AI...")
@@ -86,33 +122,30 @@ async def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, handle_signal, sig)
 
-    tasks = []
+    # 1. Запускаем SIP Worker
     sip_task = asyncio.create_task(sip_worker.start())
-    tasks.append(sip_task)
-    
+
+    # 2. Фоновые процессы (не валят сервер при ошибках)
     if telegram_bot:
-        telegram_task = asyncio.create_task(telegram_bot.start())
-        tasks.append(telegram_task)
-    
-    delivery_task = asyncio.create_task(delivery_retry_worker(database, integrations))
-    tasks.append(delivery_task)
+        asyncio.create_task(
+            safe_telegram_runner(telegram_bot, shutdown_event)
+        )
 
-    async def monitor_tasks():
-        while not shutdown_event.is_set():
-            for i, task in enumerate(tasks):
-                if task.done() and not shutdown_event.is_set():
-                    try:
-                        task.result()
-                    except Exception as e:
-                        logger.error("Critical task %d failed: %s, initiating shutdown", i, e)
-                        shutdown_event.set()
-                        return
-            await asyncio.sleep(1)
-    
-    monitor_task = asyncio.create_task(monitor_tasks())
-    tasks.append(monitor_task)
+    asyncio.create_task(
+        delivery_retry_worker(database, integrations, shutdown_event)
+    )
 
-    await shutdown_event.wait()
+    # Мониторим ТОЛЬКО критичный SIP Worker
+    while not shutdown_event.is_set():
+        if sip_task.done():
+            try:
+                sip_task.result()
+            except Exception as e:
+                logger.error("Critical SIPWorker task failed: %s", e)
+            shutdown_event.set()
+            break
+        await asyncio.sleep(1)
+
     logger.info("Initiating graceful shutdown...")
 
     await sip_worker.graceful_stop()
@@ -121,13 +154,7 @@ async def main():
     await integrations.close()
     await database.close()
 
-    for task in tasks:
-        if not task.done():
-            task.cancel()
-    await asyncio.gather(*tasks, return_exceptions=True)
-
     logger.info("Shutdown complete")
-
 
 if __name__ == "__main__":
     try:
