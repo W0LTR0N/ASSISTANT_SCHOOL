@@ -4,9 +4,6 @@ import logging
 import re
 from typing import Optional
 
-import aiohttp
-from aiosocksy.connector import ProxyConnector, ProxyType
-
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.client.default import DefaultBotProperties
@@ -48,37 +45,6 @@ def normalize_phone(phone: str) -> str | None:
     return '+' + digits
 
 
-def parse_proxy_url(proxy_url: str) -> dict:
-    """Парсинг proxy URL на компоненты."""
-    result = {
-        'proxy_type': ProxyType.SOCKS5,
-        'host': None,
-        'port': None,
-        'username': None,
-        'password': None,
-    }
-    
-    url = proxy_url.strip()
-    if url.startswith('socks5://'):
-        url = url[9:]
-    elif url.startswith('socks4://'):
-        result['proxy_type'] = ProxyType.SOCKS4
-        url = url[9:]
-    
-    if '@' in url:
-        auth, rest = url.rsplit('@', 1)
-        if ':' in auth:
-            result['username'], result['password'] = auth.split(':', 1)
-        url = rest
-    
-    if ':' in url:
-        host, port = url.rsplit(':', 1)
-        result['host'] = host
-        result['port'] = int(port)
-    
-    return result
-
-
 class TelegramBot:
     def __init__(self, sip_worker):
         self.sip_worker = sip_worker
@@ -91,20 +57,8 @@ class TelegramBot:
             if TELEGRAM_PROXY_URL:
                 logger.info("Using Telegram proxy...")
                 
-                proxy_info = parse_proxy_url(TELEGRAM_PROXY_URL)
-                logger.info(f"Proxy: {proxy_info['host']}:{proxy_info['port']}")
-                
-                connector = ProxyConnector(
-                    proxy_type=proxy_info['proxy_type'],
-                    host=proxy_info['host'],
-                    port=proxy_info['port'],
-                    username=proxy_info['username'],
-                    password=proxy_info['password'],
-                    rdns=True
-                )
-                
-                aiohttp_session = aiohttp.ClientSession(connector=connector)
-                session = AiohttpSession(aiohttp_session)
+                # Создаём сессию с proxy
+                session = AiohttpSession(proxy=TELEGRAM_PROXY_URL)
                 
                 self.bot = Bot(
                     token=TELEGRAM_BOT_TOKEN,
@@ -137,7 +91,7 @@ class TelegramBot:
 
     async def _cmd_start(self, message: types.Message):
         await message.answer(
-            " <b>WOLTRON Voice AI</b>\n\n"
+            "🤖 <b>WOLTRON Voice AI</b>\n\n"
             "Команды:\n"
             "/call <номер> — initiate outbound call\n"
             "/terminate <call_id> — terminate active call\n"
@@ -208,7 +162,7 @@ class TelegramBot:
             await message.answer("📊 <b>Нет активных звонков</b>")
             return
 
-        lines = [" <b>Активные звонки:</b>\n"]
+        lines = ["📊 <b>Активные звонки:</b>\n"]
         for call_id, session in active_calls.items():
             phone = session.get("phone", "Unknown")
             state = session.get("state", "Unknown")
