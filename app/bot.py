@@ -4,6 +4,9 @@ import logging
 import re
 from typing import Optional
 
+import aiohttp
+from python_socks.async_.aiohttp import Proxy
+
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.client.default import DefaultBotProperties
@@ -57,8 +60,17 @@ class TelegramBot:
             if TELEGRAM_PROXY_URL:
                 logger.info("Using Telegram proxy...")
                 
-                # Создаём сессию с proxy
-                session = AiohttpSession(proxy=TELEGRAM_PROXY_URL)
+                # Создаём proxy
+                proxy = Proxy.from_url(TELEGRAM_PROXY_URL)
+                
+                # Создаём aiohttp session с proxy
+                connector = aiohttp.TCPConnector(
+                    limit=100,
+                    ssl=False
+                )
+                
+                # Создаём session
+                session = AiohttpSession(connector=connector)
                 
                 self.bot = Bot(
                     token=TELEGRAM_BOT_TOKEN,
