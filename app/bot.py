@@ -4,12 +4,10 @@ import logging
 import re
 from typing import Optional
 
-import aiohttp
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiohttp_socks import ProxyConnector
 
 from config import (
     TELEGRAM_BOT_TOKEN, 
@@ -71,12 +69,8 @@ class TelegramBot:
                 
                 logger.info("Proxy string: %s", proxy_str.replace(TELEGRAM_PROXY_PASSWORD, '***') if TELEGRAM_PROXY_PASSWORD else proxy_str)
                 
-                # Создаём aiohttp session с proxy
-                connector = ProxyConnector.from_url(proxy_str, rdns=True)
-                aiohttp_session = aiohttp.ClientSession(connector=connector)
-                
-                # Создаём aiogram session на основе aiohttp session
-                session = AiohttpSession(aiohttp_session)
+                # Создаём сессию с proxy
+                session = AiohttpSession(proxy=proxy_str)
                 
                 self.bot = Bot(
                     token=TELEGRAM_BOT_TOKEN,
@@ -150,7 +144,7 @@ class TelegramBot:
 
     async def _cmd_terminate(self, message: types.Message):
         if not self._is_admin(message.from_user.id):
-            await message.answer(" У вас нет доступа к этому боту.")
+            await message.answer("⛔ У вас нет доступа к этому боту.")
             return
 
         parts = message.text.split(maxsplit=1)
@@ -164,14 +158,14 @@ class TelegramBot:
             if success:
                 await message.answer(f"✅ <b>Звонок {call_id} завершается</b>")
             else:
-                await message.answer(f"❌ <b>Не удалось завершить звонок {call_id}</b>")
+                await message.answer(f" <b>Не удалось завершить звонок {call_id}</b>")
         except Exception as e:
             logger.error("Error terminating call: %s", e)
-            await message.answer(" Произошла ошибка")
+            await message.answer("❌ Произошла ошибка")
 
     async def _cmd_status(self, message: types.Message):
         if not self._is_admin(message.from_user.id):
-            await message.answer("⛔ У вас нет доступа к этому боту.")
+            await message.answer(" У вас нет доступа к этому боту.")
             return
 
         active_calls = self.sip_worker.get_active_calls()
