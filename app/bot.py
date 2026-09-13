@@ -1,4 +1,4 @@
-"""Telegram-бот с поддержкой SOCKS5 proxy."""
+"""Telegram-бот."""
 
 import logging
 import re
@@ -7,19 +7,13 @@ from typing import Optional
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.client.default import DefaultBotProperties
-from aiogram.client.session.aiohttp import AiohttpSession
 
-from config import (
-    TELEGRAM_BOT_TOKEN, 
-    TELEGRAM_ADMIN_IDS,
-    TELEGRAM_PROXY_URL,
-)
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_ADMIN_IDS
 
 logger = logging.getLogger("bot")
 
 
 def normalize_phone(phone: str) -> str | None:
-    """Нормализация номера телефона к формату +7XXXXXXXXXX. SIP-safe."""
     if not phone:
         return None
     phone = phone.strip()
@@ -48,37 +42,12 @@ def normalize_phone(phone: str) -> str | None:
 class TelegramBot:
     def __init__(self, sip_worker):
         self.sip_worker = sip_worker
-        self.bot: Optional[Bot] = None
-        self.dp: Optional[Dispatcher] = None
-        self._setup_bot()
-
-    def _setup_bot(self):
-        try:
-            if TELEGRAM_PROXY_URL:
-                logger.info("Using Telegram proxy...")
-                
-                # Создаём сессию с proxy
-                session = AiohttpSession(proxy=TELEGRAM_PROXY_URL)
-                
-                self.bot = Bot(
-                    token=TELEGRAM_BOT_TOKEN,
-                    session=session,
-                    default=DefaultBotProperties(parse_mode="HTML")
-                )
-                logger.info("Telegram bot initialized with proxy")
-            else:
-                logger.info("Using Telegram without proxy")
-                self.bot = Bot(
-                    token=TELEGRAM_BOT_TOKEN,
-                    default=DefaultBotProperties(parse_mode="HTML")
-                )
-            
-            self.dp = Dispatcher()
-            self._setup_handlers()
-            
-        except Exception as e:
-            logger.error("Failed to setup Telegram bot: %s", e)
-            raise
+        self.bot = Bot(
+            token=TELEGRAM_BOT_TOKEN,
+            default=DefaultBotProperties(parse_mode="HTML")
+        )
+        self.dp = Dispatcher()
+        self._setup_handlers()
 
     def _setup_handlers(self):
         self.dp.message.register(self._cmd_start, Command("start"))
@@ -105,7 +74,7 @@ class TelegramBot:
 
         parts = message.text.split(maxsplit=1)
         if len(parts) < 2:
-            await message.answer("Используй: /call <номер>\nПример: /call +79991234567")
+            await message.answer("Используй: /call <номер>")
             return
 
         raw_phone = parts[1].strip()
@@ -150,7 +119,7 @@ class TelegramBot:
                 await message.answer(f"❌ <b>Не удалось завершить звонок {call_id}</b>")
         except Exception as e:
             logger.error("Error terminating call: %s", e)
-            await message.answer(" Произошла ошибка")
+            await message.answer("❌ Произошла ошибка")
 
     async def _cmd_status(self, message: types.Message):
         if not self._is_admin(message.from_user.id):
@@ -162,7 +131,7 @@ class TelegramBot:
             await message.answer("📊 <b>Нет активных звонков</b>")
             return
 
-        lines = ["📊 <b>Активные звонки:</b>\n"]
+        lines = [" <b>Активные звонки:</b>\n"]
         for call_id, session in active_calls.items():
             phone = session.get("phone", "Unknown")
             state = session.get("state", "Unknown")
@@ -172,9 +141,6 @@ class TelegramBot:
 
     async def start(self):
         logger.info("Starting Telegram bot...")
-        if not self.bot or not self.dp:
-            logger.error("Telegram bot not initialized")
-            return
         await self.dp.start_polling(self.bot, handle_signals=False)
 
     async def stop(self):
