@@ -1,3 +1,10 @@
+import sys
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
 import logging
 import re
 from aiogram import Bot, Dispatcher, types
@@ -11,18 +18,17 @@ from database import Database
 logger = logging.getLogger(__name__)
 
 def clean_phone(phone: str) -> str:
-    """Приводит любой ввод к чистому виду 79XXXXXXXXX для SIP-провайдера."""
+    """Приводит номер к формату 79XXXXXXXXX."""
     digits = re.sub(r'\D', '', phone)
     if digits.startswith('8') and len(digits) == 11:
         digits = '7' + digits[1:]
     return digits
 
 class TelegramBot:
-    def __init__(self, sip_worker):
+    def __init__(self, sip_worker, db: Database):
         self.sip_worker = sip_worker
-        self.db = Database()
+        self.db = db  # Используем только переданную инициализированную БД
        
-        # Безопасное извлечение параметров из любой структуры config.py
         config_obj = getattr(config, 'config', getattr(config, 'Config', config))
         bot_token = getattr(config_obj, 'TELEGRAM_BOT_TOKEN', None)
         proxy_url = getattr(config_obj, 'TELEGRAM_PROXY_URL', None)
@@ -49,8 +55,8 @@ class TelegramBot:
         text = (
             "<b>WOLTRON Voice AI — Панель управления</b>\n\n"
             "<b>Команды запуска:</b>\n"
-            "• <code>/call &lt;номер&gt;</code> — Звонок ДО урока (Квалификация)\n"
-            "• <code>/call_after &lt;номер&gt;</code> — Звонок ПОСЛЕ урока (Продажа абонемента)\n\n"
+            "• <code>/call &lt;номер&gt;</code> — Звонок ДО урока\n"
+            "• <code>/call_after &lt;номер&gt;</code> — Звонок ПОСЛЕ урока\n\n"
             "<b>Управление:</b>\n"
             "• <code>/status</code> — Активные звонки\n"
             "• <code>/terminate &lt;call_id&gt;</code> — Сбросить звонок"
@@ -75,7 +81,12 @@ class TelegramBot:
        
         try:
             call_id = await self.sip_worker.make_call(phone=phone, scenario=scenario)
-            await self.db.create_call(call_id=call_id, phone=phone, scenario=scenario)
+            await self.db.create_call(
+                call_id=call_id,
+                direction="OUTBOUND",
+                scenario=scenario,
+                phone=phone
+            )
             await message.answer(f"Звонок пошел!\nCall ID: <code>{call_id}</code>", parse_mode=ParseMode.HTML)
         except Exception as e:
             logger.error(f"Ошибка вызова: {e}", exc_info=True)
@@ -88,15 +99,19 @@ class TelegramBot:
         await self._make_call(message, scenario="AFTER_LESSON", label="После урока")
 
     async def cmd_status(self, message: types.Message):
-        calls = await self.db.get_active_calls()
-        if not calls:
-            await message.answer("Активных звонков нет.")
-            return
+        try:
+            calls = await self.db.get_pending_deliveries()
+            if not calls:
+                await message.answer("Активных или ожидающих звонков нет.")
+                return
 
-        text = "<b>Активные звонки:</b>\n"
-        for c in calls:
-            text += f"• <code>{c['call_id']}</code> | {c['phone']} | {c['status']}\n"
-        await message.answer(text, parse_mode=ParseMode.HTML)
+            text = "<b>Статус звонков:</b>\n"
+            for c in calls:
+                text += f"• <code>{c['call_id']}</code> | Status: {c['albato_status']}\n"
+            await message.answer(text, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            logger.error(f"Ошибка выполнения status: {e}", exc_info=True)
+            await message.answer(f"Ошибка получения статуса: {e}")
 
     async def cmd_terminate(self, message: types.Message):
         args = message.text.split(maxsplit=1)
@@ -106,7 +121,8 @@ class TelegramBot:
 
         call_id = args[1].strip()
         try:
-            await self.sip_worker.terminate_call(call_id)
+            if hasattr(self.sip_worker, 'terminate_call'):
+                await self.sip_worker.terminate_call(call_id)
             await self.db.update_call_status(call_id, "TERMINATED")
             await message.answer(f"Звонок <code>{call_id}</code> успешно завершен.", parse_mode=ParseMode.HTML)
         except Exception as e:
