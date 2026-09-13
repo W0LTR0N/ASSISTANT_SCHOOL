@@ -4,8 +4,7 @@ import logging
 import re
 from typing import Optional
 
-import aiohttp
-from python_socks.async_.aiohttp import Proxy
+from aiohttp_socks import ProxyConnector
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -60,14 +59,8 @@ class TelegramBot:
             if TELEGRAM_PROXY_URL:
                 logger.info("Using Telegram proxy...")
                 
-                # Создаём proxy
-                proxy = Proxy.from_url(TELEGRAM_PROXY_URL)
-                
-                # Создаём aiohttp session с proxy
-                connector = aiohttp.TCPConnector(
-                    limit=100,
-                    ssl=False
-                )
+                # Создаём connector с proxy
+                connector = ProxyConnector.from_url(TELEGRAM_PROXY_URL)
                 
                 # Создаём session
                 session = AiohttpSession(connector=connector)
@@ -112,7 +105,7 @@ class TelegramBot:
 
     async def _cmd_call(self, message: types.Message):
         if not self._is_admin(message.from_user.id):
-            await message.answer("⛔ У вас нет доступа к этому боту.")
+            await message.answer(" У вас нет доступа к этому боту.")
             return
 
         parts = message.text.split(maxsplit=1)
@@ -162,7 +155,7 @@ class TelegramBot:
                 await message.answer(f"❌ <b>Не удалось завершить звонок {call_id}</b>")
         except Exception as e:
             logger.error("Error terminating call: %s", e)
-            await message.answer(" Произошла ошибка")
+            await message.answer("❌ Произошла ошибка")
 
     async def _cmd_status(self, message: types.Message):
         if not self._is_admin(message.from_user.id):
