@@ -103,10 +103,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 TELEGRAM_ADMIN_IDS = _parse_set("TELEGRAM_ADMIN_IDS")
 
-# Telegram Proxy (SOCKS5) - для обхода блокировок
+# Telegram Proxy (SOCKS5)
 TELEGRAM_PROXY_URL = os.getenv("TELEGRAM_PROXY_URL", "")
-TELEGRAM_PROXY_LOGIN = os.getenv("TELEGRAM_PROXY_LOGIN", "")
-TELEGRAM_PROXY_PASSWORD = os.getenv("TELEGRAM_PROXY_PASSWORD", "")
 
 # === Database ===
 DATABASE_PATH = os.getenv("DATABASE_PATH", "/app/data/woltron.db")
