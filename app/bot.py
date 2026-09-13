@@ -5,13 +5,9 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 
-# Универсальный импорт для Docker контейнера и локального запуска
-try:
-  from config import config
-  from database import Database
-except ImportError:
-  from app.config import config
-  from app.database import Database
+# Импортируем сам модуль config и класс Database
+import config
+from database import Database
 
 logger = logging.getLogger(__name__)
 
@@ -28,11 +24,23 @@ class TelegramBot:
     self.sip_worker = sip_worker
     self.db = Database()
 
-    session = None
-    if getattr(config, 'TELEGRAM_PROXY_URL', None):
-      session = AiohttpSession(proxy=config.TELEGRAM_PROXY_URL)
+    # Получаем токен и прокси вне зависимости от того, класс Config или переменные
+    bot_token = getattr(
+        config,
+        'TELEGRAM_BOT_TOKEN',
+        getattr(getattr(config, 'Config', None), 'TELEGRAM_BOT_TOKEN', None),
+    )
+    proxy_url = getattr(
+        config,
+        'TELEGRAM_PROXY_URL',
+        getattr(getattr(config, 'Config', None), 'TELEGRAM_PROXY_URL', None),
+    )
 
-    self.bot = Bot(token=config.TELEGRAM_BOT_TOKEN, session=session)
+    session = None
+    if proxy_url:
+      session = AiohttpSession(proxy=proxy_url)
+
+    self.bot = Bot(token=bot_token, session=session)
     self.dp = Dispatcher()
     self._register_handlers()
 
