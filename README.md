@@ -18,12 +18,12 @@ Yandex STT → Agent/GPT → GenVoice TTS
 ↓
 Albato + Telegram (результат)
 12345678910
-Команды Telegram
+## Команды Telegram
 /start — справка
 /call <номер> — исходящий звонок
 /terminate <call_id> — завершить звонок
 /status — активные звонки
-LIVE TEST PROCEDURE
+## LIVE TEST PROCEDURE
 Запуск: docker compose up -d && docker compose logs -f
 Проверка REGISTER: в логах REGISTER sent → REGISTERED
 Telegram /status: "Нет активных звонков"
@@ -45,7 +45,7 @@ Albato idempotency зависит от endpoint
 Порты
 SIP: UDP 5060
 RTP: UDP 10000-10100
-Environment
+## Environment
 См. .env.example для полного списка.
 Критичные для production:
 PLUSOFON_SIP_HOST/USER/PASSWORD
