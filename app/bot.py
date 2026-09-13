@@ -13,8 +13,6 @@ from config import (
     TELEGRAM_BOT_TOKEN, 
     TELEGRAM_ADMIN_IDS,
     TELEGRAM_PROXY_URL,
-    TELEGRAM_PROXY_LOGIN,
-    TELEGRAM_PROXY_PASSWORD,
 )
 
 logger = logging.getLogger("bot")
@@ -59,24 +57,15 @@ class TelegramBot:
             if TELEGRAM_PROXY_URL:
                 logger.info("Using Telegram proxy...")
                 
-                # Собираем proxy URL
-                proxy_str = TELEGRAM_PROXY_URL.strip()
-                if not proxy_str.startswith("socks5://"):
-                    if TELEGRAM_PROXY_LOGIN and TELEGRAM_PROXY_PASSWORD:
-                        proxy_str = f"socks5://{TELEGRAM_PROXY_LOGIN}:{TELEGRAM_PROXY_PASSWORD}@{proxy_str}"
-                    else:
-                        proxy_str = f"socks5://{proxy_str}"
-                
-                logger.info("Proxy string: %s", proxy_str.replace(TELEGRAM_PROXY_PASSWORD, '***') if TELEGRAM_PROXY_PASSWORD else proxy_str)
-                
                 # Создаём сессию с proxy
-                session = AiohttpSession(proxy=proxy_str)
+                session = AiohttpSession(proxy=TELEGRAM_PROXY_URL)
                 
                 self.bot = Bot(
                     token=TELEGRAM_BOT_TOKEN,
                     session=session,
                     default=DefaultBotProperties(parse_mode="HTML")
                 )
+                logger.info("Telegram bot initialized with proxy")
             else:
                 logger.info("Using Telegram without proxy")
                 self.bot = Bot(
@@ -158,14 +147,14 @@ class TelegramBot:
             if success:
                 await message.answer(f"✅ <b>Звонок {call_id} завершается</b>")
             else:
-                await message.answer(f" <b>Не удалось завершить звонок {call_id}</b>")
+                await message.answer(f"❌ <b>Не удалось завершить звонок {call_id}</b>")
         except Exception as e:
             logger.error("Error terminating call: %s", e)
-            await message.answer("❌ Произошла ошибка")
+            await message.answer(" Произошла ошибка")
 
     async def _cmd_status(self, message: types.Message):
         if not self._is_admin(message.from_user.id):
-            await message.answer(" У вас нет доступа к этому боту.")
+            await message.answer("⛔ У вас нет доступа к этому боту.")
             return
 
         active_calls = self.sip_worker.get_active_calls()
