@@ -4,8 +4,7 @@ uvicorn[standard]==0.30.6
 
 # Telegram
 aiogram==3.13.1
-aiosocksy==0.1.2
-setuptools==69.1.0
+python-socks==2.4.0
 
 # Database
 aiosqlite==0.20.0
