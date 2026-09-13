@@ -1,6 +1,7 @@
 import sys
 from pathlib import Path
 
+# Добавляем папку /app в путь импорта Python
 BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
@@ -15,7 +16,7 @@ from database import Database
 from bot import TelegramBot
 from sip_worker import SIPWorker
 
-# Пытаемся импортировать голосовой движок, если он у тебя вынесен отдельно
+# Пробуем импортировать VoiceEngine, если он есть
 try:
     from voice_engine import VoiceEngine
 except ImportError:
@@ -43,13 +44,16 @@ async def run_fastapi():
 async def main():
     logger.info("Starting WOLTRON Voice AI System...")
    
-    # 1. База данных уже нормально инициализируется сама!
+    # 1. Создаем экземпляр базы данных
     db = Database()
 
-    # 2. Создаем VoiceEngine (если есть отдельный класс)
+    # 2. Обязательно инициализируем подключение SQLite (открываем self.conn)
+    await db.init()
+
+    # 3. Подготавливаем голосовой движок
     voice_engine = VoiceEngine() if VoiceEngine else None
 
-    # 3. Передаем в SIPWorker аргументы, которые он требует
+    # 4. Инициализируем SIPWorker с переданной базой
     try:
         sip_worker = SIPWorker(voice_engine, db, config)
     except TypeError:
@@ -58,12 +62,13 @@ async def main():
         except TypeError:
             sip_worker = SIPWorker(db)
 
-    # 4. Передаем в TelegramBot требуемые зависимости
+    # 5. Инициализируем бота
     try:
         bot = TelegramBot(sip_worker, db)
     except TypeError:
         bot = TelegramBot(sip_worker)
 
+    # 6. Параллельный запуск всех компонентов
     await asyncio.gather(
         run_fastapi(),
         bot.start(),
