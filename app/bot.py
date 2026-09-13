@@ -1,211 +1,125 @@
-"""Telegram-бот для управления WOLTRON Voice AI."""
-
 import logging
 import re
-from typing import Optional
-
 from aiogram import Bot, Dispatcher, types
-from aiogram.client.default import DefaultBotProperties
-from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command
+from aiogram.enums import ParseMode
+from aiogram.client.session.aiohttp import AiohttpSession
 
-# Пробуем импортировать прокси под любым из имен
-try:
-    from config import TELEGRAM_PROXY_URL as PROXY_URL
-except ImportError:
-    try:
-        from config import PROXY_URL
-    except ImportError:
-        PROXY_URL = None
+from app.config import config
+from app.database import Database
 
-from config import TELEGRAM_ADMIN_IDS, TELEGRAM_BOT_TOKEN
+logger = logging.getLogger(__name__)
 
-logger = logging.getLogger("bot")
-
-def normalize_phone(phone: str) -> str | None:
-    """Нормализация номера телефона к формату +7XXXXXXXXXX. SIP-safe."""
-    if not phone:
-        return None
-    phone = phone.strip()
-    phone = re.sub(r"[^\d+]", "", phone)
-    if phone.count("+") > 1:
-        phone = phone.replace("+", "", phone.count("+") - 1)
-    digits = re.sub(r"[^\d]", "", phone)
-
-    if len(digits) == 11:
-        if digits.startswith("8"):
-            digits = "7" + digits[1:]
-        elif digits.startswith("7"):
-            pass
-        else:
-            return None
-    elif len(digits) == 10:
-        digits = "7" + digits
-    else:
-        return None
-
-    if len(digits) != 11 or not digits.startswith("7"):
-        return None
-    return "+" + digits
+def clean_phone(phone: str) -> str:
+    """Приводит номер к чистому цифровому формату без '+' для SIP-провайдера."""
+    digits = re.sub(r'\D', '', phone)
+    if digits.startswith('8') and len(digits) == 11:
+        digits = '7' + digits[1:]
+    return digits
 
 class TelegramBot:
-
     def __init__(self, sip_worker):
         self.sip_worker = sip_worker
+        self.db = Database()
 
-        # Изолируем трафик Telegram через прокси (или ставим жесткий таймаут 15s)
-        if PROXY_URL:
-            logger.info("Initializing Telegram bot with Proxy: %s", PROXY_URL)
-            session = AiohttpSession(proxy=PROXY_URL, timeout=15.0)
-        else:
-            logger.info(
-                "Initializing Telegram bot without proxy (15s timeout)"
-            )
-            session = AiohttpSession(timeout=15.0)
+        session = None
+        if getattr(config, 'TELEGRAM_PROXY_URL', None):
+            session = AiohttpSession(proxy=config.TELEGRAM_PROXY_URL)
 
-        self.bot = Bot(
-            token=TELEGRAM_BOT_TOKEN,
-            default=DefaultBotProperties(parse_mode="HTML"),
-            session=session,
-        )
+        self.bot = Bot(token=config.TELEGRAM_BOT_TOKEN, session=session)
         self.dp = Dispatcher()
-        self._setup_handlers()
+        self._register_handlers()
 
-    def _setup_handlers(self):
-        self.dp.message.register(self._cmd_start, Command("start"))
-        self.dp.message.register(self._cmd_call_before, Command("call"))
-        self.dp.message.register(
-            self._cmd_call_after, Command("call_after")
-        )  # Сценарий продаж
-        self.dp.message.register(self._cmd_terminate, Command("terminate"))
-        self.dp.message.register(self._cmd_status, Command("status"))
+    def _register_handlers(self):
+        self.dp.message.register(self.cmd_start, Command("start"))
+        self.dp.message.register(self.cmd_call, Command("call"))
+        self.dp.message.register(self.cmd_call_after, Command("call_after"))
+        self.dp.message.register(self.cmd_status, Command("status"))
+        self.dp.message.register(self.cmd_terminate, Command("terminate"))
 
-    def _is_admin(self, user_id: int) -> bool:
-        return str(user_id) in TELEGRAM_ADMIN_IDS
-
-    async def _cmd_start(self, message: types.Message):
-        await message.answer(
-            "🤖 <b>WOLTRON Voice AI — Панель управления</b>\n\n"
+    async def cmd_start(self, message: types.Message):
+        text = (
+            "<b>WOLTRON Voice AI — Панель управления</b>\n\n"
             "<b>Команды запуска:</b>\n"
-            "• /call &lt;номер&gt; — Звонок ДО урока (Квалификация)\n"
-            "• /call_after &lt;номер&gt; — Звонок ПОСЛЕ урока (Продажа абонемента)\n\n"
+            "• <code>/call &lt;номер&gt;</code> — Звонок ДО урока (Квалификация)\n"
+            "• <code>/call_after &lt;номер&gt;</code> — Звонок ПОСЛЕ урока\n\n"
             "<b>Управление:</b>\n"
-            "• /status — Активные звонки\n"
-            "• /terminate &lt;call_id&gt; — Сбросить звонок"
+            "• <code>/status</code> — Активные звонки\n"
+            "• <code>/terminate &lt;call_id&gt;</code> — Сбросить звонок"
         )
+        await message.answer(text, parse_mode=ParseMode.HTML)
 
-    async def _initiate_call_logic(
-        self, message: types.Message, scenario: str, scenario_title: str
-    ):
-        if not self._is_admin(message.from_user.id):
-            await message.answer("⛔ У вас нет доступа к этому боту.")
-            return
-
-        parts = message.text.split(maxsplit=1)
-        if len(parts) < 2:
-            cmd = message.text.split()[0][1:]
+    async def _make_call(self, message: types.Message, scenario: str, label: str):
+        args = message.text.split(maxsplit=1)
+        if len(args) < 2:
+            cmd = message.text.split()[0]
             await message.answer(
-                f"Используй: /{cmd} <номер>\nПример: /{cmd} +79991234567"
+                f"Использование: <code>{cmd} &lt;номер&gt;</code>",
+                parse_mode=ParseMode.HTML
             )
             return
 
-        raw_phone = parts[1].strip()
-        phone = normalize_phone(raw_phone)
+        raw_phone = args[1].strip()
+        phone = clean_phone(raw_phone)
 
-        if not phone:
-            await message.answer(f"❌ <b>Неправильный номер:</b> {raw_phone}")
+        if not phone or len(phone) < 10:
+            await message.answer("Некорректный номер телефона.")
             return
 
         await message.answer(
-            f"☎️ <b>Инициирую звонок ({scenario_title}) на {phone}...</b>"
+            f"Инициирую звонок ({label}) на <b>{phone}</b>...",
+            parse_mode=ParseMode.HTML
         )
 
         try:
-            call_id = await self.sip_worker.originate_call(
-                phone,
-                scenario=scenario,
-                metadata={
-                    "source": "telegram",
-                    "user_id": message.from_user.id,
-                },
+            call_id = await self.sip_worker.make_call(phone=phone, scenario=scenario)
+            await self.db.create_call(call_id=call_id, phone=phone, scenario=scenario)
+            await message.answer(
+                f"Звонок пошел!\nCall ID: <code>{call_id}</code>",
+                parse_mode=ParseMode.HTML
             )
-            if call_id:
-                await message.answer(
-                    f"✅ <b>Звонок пошел!</b>\nCall ID: <code>{call_id}</code>"
-                )
-            else:
-                await message.answer(
-                    "❌ <b>Не удалось инициировать звонок (SIP Error)</b>"
-                )
         except Exception as e:
-            logger.error("Error initiating call: %s", e)
-            await message.answer("❌ Произошла ошибка при запуске звонка")
+            logger.error(f"Ошибка вызова: {e}", exc_info=True)
+            await message.answer(f"Ошибка при совершении звонка: {e}")
 
-    async def _cmd_call_before(self, message: types.Message):
-        await self._initiate_call_logic(
-            message, scenario="BEFORE_LESSON", scenario_title="До урока"
-        )
+    async def cmd_call(self, message: types.Message):
+        await self._make_call(message, scenario="BEFORE_LESSON", label="До урока")
 
-    async def _cmd_call_after(self, message: types.Message):
-        await self._initiate_call_logic(
-            message, scenario="AFTER_LESSON", scenario_title="Продажа"
-        )
+    async def cmd_call_after(self, message: types.Message):
+        await self._make_call(message, scenario="AFTER_LESSON", label="После урока")
 
-    async def _cmd_terminate(self, message: types.Message):
-        if not self._is_admin(message.from_user.id):
-            await message.answer("⛔ У вас нет доступа к этому боту.")
+    async def cmd_status(self, message: types.Message):
+        calls = await self.db.get_active_calls()
+        if not calls:
+            await message.answer("Активных звонков нет.")
             return
 
-        parts = message.text.split(maxsplit=1)
-        if len(parts) < 2:
-            await message.answer("Используй: /terminate <call_id>")
+        text = "<b>Активные звонки:</b>\n"
+        for c in calls:
+            text += f"• <code>{c['call_id']}</code> | {c['phone']} | {c['status']}\n"
+        await message.answer(text, parse_mode=ParseMode.HTML)
+
+    async def cmd_terminate(self, message: types.Message):
+        args = message.text.split(maxsplit=1)
+        if len(args) < 2:
+            await message.answer(
+                "Используй: <code>/terminate &lt;call_id&gt;</code>",
+                parse_mode=ParseMode.HTML
+            )
             return
 
-        call_id = parts[1].strip()
+        call_id = args[1].strip()
         try:
-            success = await self.sip_worker.terminate_call(call_id)
-            if success:
-                await message.answer(
-                    f"✅ <b>Звонок {call_id} завершается</b>"
-                )
-            else:
-                await message.answer(
-                    f"❌ <b>Не удалось завершить звонок {call_id}</b>"
-                )
-        except Exception as e:
-            logger.error("Error terminating call: %s", e)
-            await message.answer("❌ Произошла ошибка")
-
-    async def _cmd_status(self, message: types.Message):
-        if not self._is_admin(message.from_user.id):
-            await message.answer("⛔ У вас нет доступа к этому боту.")
-            return
-
-        active_calls = self.sip_worker.get_active_calls()
-        if not active_calls:
-            await message.answer("📊 <b>Нет активных звонков</b>")
-            return
-
-        lines = ["📊 <b>Активные звонки:</b>\n"]
-        for call_id, session in active_calls.items():
-            phone = session.get("phone", "Unknown")
-            state = session.get("state", "Unknown")
-            lines.append(
-                f"• <code>{call_id}</code>\n  Phone: {phone}\n  State: {state}\n"
+            await self.sip_worker.terminate_call(call_id)
+            await self.db.update_call_status(call_id, "TERMINATED")
+            await message.answer(
+                f"Звонок <code>{call_id}</code> успешно завершен.",
+                parse_mode=ParseMode.HTML
             )
-
-        await message.answer("\n".join(lines))
+        except Exception as e:
+            logger.error(f"Ошибка сброса звонка: {e}", exc_info=True)
+            await message.answer(f"Не удалось сбросить звонок: {e}")
 
     async def start(self):
         logger.info("Starting Telegram bot polling...")
-        try:
-            await self.bot.delete_webhook(drop_pending_updates=True)
-            await self.dp.start_polling(self.bot, handle_signals=False)
-        except Exception as e:
-            logger.error("Error inside Telegram bot polling: %s", e)
-            raise e
-
-    async def stop(self):
-        logger.info("Stopping Telegram bot...")
-        if self.bot:
-            await self.bot.session.close()
+        await self.dp.start_polling(self.bot)
