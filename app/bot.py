@@ -4,6 +4,7 @@ import logging
 import re
 from typing import Optional
 
+import aiohttp
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.client.default import DefaultBotProperties
@@ -22,6 +23,7 @@ logger = logging.getLogger("bot")
 
 
 def normalize_phone(phone: str) -> str | None:
+    """Нормализация номера телефона к формату +7XXXXXXXXXX. SIP-safe."""
     if not phone:
         return None
     phone = phone.strip()
@@ -59,7 +61,7 @@ class TelegramBot:
             if TELEGRAM_PROXY_URL:
                 logger.info("Using Telegram proxy...")
                 
-                # Умная обработка: если вставили полную ссылку, используем её. Иначе собираем.
+                # Собираем proxy URL
                 proxy_str = TELEGRAM_PROXY_URL.strip()
                 if not proxy_str.startswith("socks5://"):
                     if TELEGRAM_PROXY_LOGIN and TELEGRAM_PROXY_PASSWORD:
@@ -69,8 +71,13 @@ class TelegramBot:
                 
                 logger.info("Proxy string: %s", proxy_str.replace(TELEGRAM_PROXY_PASSWORD, '***') if TELEGRAM_PROXY_PASSWORD else proxy_str)
                 
+                # Создаём aiohttp session с proxy
                 connector = ProxyConnector.from_url(proxy_str, rdns=True)
-                session = AiohttpSession(connector=connector)
+                aiohttp_session = aiohttp.ClientSession(connector=connector)
+                
+                # Создаём aiogram session на основе aiohttp session
+                session = AiohttpSession(aiohttp_session)
+                
                 self.bot = Bot(
                     token=TELEGRAM_BOT_TOKEN,
                     session=session,
@@ -143,7 +150,7 @@ class TelegramBot:
 
     async def _cmd_terminate(self, message: types.Message):
         if not self._is_admin(message.from_user.id):
-            await message.answer("⛔ У вас нет доступа к этому боту.")
+            await message.answer(" У вас нет доступа к этому боту.")
             return
 
         parts = message.text.split(maxsplit=1)
@@ -160,7 +167,7 @@ class TelegramBot:
                 await message.answer(f"❌ <b>Не удалось завершить звонок {call_id}</b>")
         except Exception as e:
             logger.error("Error terminating call: %s", e)
-            await message.answer("❌ Произошла ошибка")
+            await message.answer(" Произошла ошибка")
 
     async def _cmd_status(self, message: types.Message):
         if not self._is_admin(message.from_user.id):
