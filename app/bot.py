@@ -4,8 +4,6 @@ import logging
 import re
 from typing import Optional
 
-from aiohttp_socks import ProxyConnector
-
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.client.default import DefaultBotProperties
@@ -57,18 +55,18 @@ class TelegramBot:
     def _setup_bot(self):
         try:
             if TELEGRAM_PROXY_URL:
-                logger.info("Using Telegram proxy...")
+                logger.info("Using Telegram proxy: %s", TELEGRAM_PROXY_URL)
                 
-                # Создаём connector с proxy
-                connector = ProxyConnector.from_url(TELEGRAM_PROXY_URL)
-                
-                # Создаём session
-                session = AiohttpSession(connector=connector)
+                # Создаём сессию с proxy через DefaultBotProperties
+                session = AiohttpSession()
                 
                 self.bot = Bot(
                     token=TELEGRAM_BOT_TOKEN,
                     session=session,
-                    default=DefaultBotProperties(parse_mode="HTML")
+                    default=DefaultBotProperties(
+                        parse_mode="HTML",
+                        proxy=TELEGRAM_PROXY_URL
+                    )
                 )
                 logger.info("Telegram bot initialized with proxy")
             else:
@@ -105,7 +103,7 @@ class TelegramBot:
 
     async def _cmd_call(self, message: types.Message):
         if not self._is_admin(message.from_user.id):
-            await message.answer(" У вас нет доступа к этому боту.")
+            await message.answer("⛔ У вас нет доступа к этому боту.")
             return
 
         parts = message.text.split(maxsplit=1)
@@ -155,7 +153,7 @@ class TelegramBot:
                 await message.answer(f"❌ <b>Не удалось завершить звонок {call_id}</b>")
         except Exception as e:
             logger.error("Error terminating call: %s", e)
-            await message.answer("❌ Произошла ошибка")
+            await message.answer(" Произошла ошибка")
 
     async def _cmd_status(self, message: types.Message):
         if not self._is_admin(message.from_user.id):
