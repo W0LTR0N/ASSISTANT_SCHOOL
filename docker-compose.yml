@@ -2,11 +2,9 @@ services:
   app:
     build: .
     env_file: .env
-    environment:
-      - HTTPS_PROXY=${HTTPS_PROXY}
-      - HTTP_PROXY=${HTTP_PROXY}
-      - ALL_PROXY=${ALL_PROXY}
-      - NO_PROXY=localhost,127.0.0.1,193320.voice.plusofon.ru
+    # УБРАНЫ прокси-переменные из environment!
+    # Telegram бот использует свой прокси через AiohttpSession
+    # HTTP клиент в integrations.py настроен отдельно
     ports:
       - "5060:5060/udp"
       - "10000-10100:10000-10100/udp"
