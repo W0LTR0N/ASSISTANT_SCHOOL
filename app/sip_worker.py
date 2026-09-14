@@ -26,7 +26,7 @@ from config import (
     MAX_CONCURRENT_CALLS, MAX_CALL_DURATION, MEDIA_IDLE_TIMEOUT,
     MAX_RTP_BUFFER_BYTES,
     SIP_T1, SIP_T2, SIP_TIMER_B, SIP_TIMER_F, SIP_MAX_RETRANSMITS,
-    SIP_RATE_LIMIT_PER_IP,
+    SIP_RATE_LIMIT_PER_IP, DEVELOPMENT_MODE,
 )
 
 logger = logging.getLogger("sip_worker")
@@ -600,7 +600,13 @@ class SIPWorker:
         self.register_state["state"] = "REGISTER_SENT"
         auth_header = self._compute_digest(self.auth_cache, proxy=self.auth_cache.get("_proxy", False)) if self.auth_cache else ""
         msg = self._build_register_message(auth_header)
-        await self._send_sip_message(msg)
+        
+        logger.info("Sending REGISTER to %s:%d (CSeq=%d)", self.host, self.port, self.register_state["cseq"])
+        sent = await self._send_sip_message(msg)
+        if not sent:
+            logger.error("Failed to send REGISTER message")
+        else:
+            logger.info("REGISTER sent successfully")
 
     async def register_loop(self):
         while self.is_running:
@@ -827,7 +833,6 @@ class SIPWorker:
         session["voice_engine_task"] = asyncio.create_task(self.voice_engine.start(call_id, session))
 
     async def originate_call(self, phone, scenario="BEFORE_LESSON", metadata=None):
-        """Инициирование исходящего звонка. Возвращает call_id или None."""
         if scenario not in ("BEFORE_LESSON", "AFTER_LESSON"):
             logger.error("Invalid scenario: %s", scenario)
             return None
@@ -848,8 +853,7 @@ class SIPWorker:
             logger.error("Cannot bind RTP port %d for outbound", rtp_port)
             return None
 
-        # ИСПРАВЛЕНО: генерируем уникальный call_id с timestamp и UUID
-        timestamp = int(time.time() * 1000)  # milliseconds
+        timestamp = int(time.time() * 1000)
         unique_id = str(uuid.uuid4())[:8]
         call_id = f"{timestamp}{unique_id}@{PUBLIC_IP}"
         
@@ -1536,20 +1540,36 @@ class SIPWorker:
         return {k: v for k, v in self.sessions.items() if not v.get("stopped")}
 
     async def start(self):
+        logger.info("Starting SIP Worker on port %d...", self.port)
+        logger.info("SIP Host: %s, User: %s", self.host, self.user)
+        logger.info("SIP_CAN_START: %s, PUBLIC_IP: %s", SIP_CAN_START, PUBLIC_IP)
+        
         if not SIP_CAN_START:
+            logger.error("SIP_CAN_START is False! Check PUBLIC_IP in .env")
             raise SystemExit(2)
+        
         self.is_running = True
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, lambda: asyncio.create_task(self.graceful_stop()))
-        transport, protocol = await loop.create_datagram_endpoint(
-            lambda: SIPProtocol(self),
-            local_addr=('0.0.0.0', self.port),
-        )
-        self.sip_transport = transport
+        
+        try:
+            transport, protocol = await loop.create_datagram_endpoint(
+                lambda: SIPProtocol(self),
+                local_addr=('0.0.0.0', self.port),
+            )
+            self.sip_transport = transport
+            logger.info("SIP transport bound to 0.0.0.0:%d", self.port)
+        except Exception as e:
+            logger.error("Failed to bind SIP transport: %s", e)
+            raise
+        
         self._register_task = asyncio.create_task(self.register_loop())
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         self._transaction_cleanup_task = asyncio.create_task(self._transaction_cleanup_loop())
+        
+        logger.info("SIP Worker started, REGISTER loop initiated")
+        
         while self.is_running:
             await asyncio.sleep(1)
 
