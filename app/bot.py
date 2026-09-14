@@ -31,7 +31,7 @@ class TelegramBot:
        
         config_obj = getattr(config, 'config', getattr(config, 'Config', config))
         bot_token = getattr(config_obj, 'TELEGRAM_BOT_TOKEN', None)
-        proxy_url = getattr(config_obj, 'TELEGRAM_PROXY_URL', None)
+        proxy_url = getattr(config_obj, 'TELEGRAM_PROXY_URL', None) or getattr(config_obj, 'PROXY_URL', None)
 
         session = None
         if proxy_url:
@@ -80,14 +80,20 @@ class TelegramBot:
         await message.answer(f"Инициирую звонок ({label}) на <b>{phone}</b>...", parse_mode=ParseMode.HTML)
        
         try:
-            call_id = await self.sip_worker.make_call(phone=phone, scenario=scenario)
+            # ИСПРАВЛЕНО: вызываем originate_call вместо несуществующего make_call
+            call_id = await self.sip_worker.originate_call(phone=phone, scenario=scenario)
+            
+            if not call_id:
+                await message.answer("❌ Не удалось инициировать звонок (возможно, достигнут лимит или ошибка SIP).")
+                return
+
             await self.db.create_call(
                 call_id=call_id,
-                direction="OUTBOUND",
+                direction="outbound",
                 scenario=scenario,
                 phone=phone
             )
-            await message.answer(f"Звонок пошел!\nCall ID: <code>{call_id}</code>", parse_mode=ParseMode.HTML)
+            await message.answer(f"✅ Звонок пошел!\nCall ID: <code>{call_id}</code>", parse_mode=ParseMode.HTML)
         except Exception as e:
             logger.error(f"Ошибка вызова: {e}", exc_info=True)
             await message.answer(f"Ошибка при совершении звонка: {e}")
@@ -122,9 +128,14 @@ class TelegramBot:
         call_id = args[1].strip()
         try:
             if hasattr(self.sip_worker, 'terminate_call'):
-                await self.sip_worker.terminate_call(call_id)
-            await self.db.update_call_status(call_id, "TERMINATED")
-            await message.answer(f"Звонок <code>{call_id}</code> успешно завершен.", parse_mode=ParseMode.HTML)
+                success = await self.sip_worker.terminate_call(call_id)
+                if success:
+                    await self.db.update_call_status(call_id, "TERMINATED", "telegram_terminate")
+                    await message.answer(f"Звонок <code>{call_id}</code> успешно завершен.", parse_mode=ParseMode.HTML)
+                else:
+                    await message.answer(f"Звонок <code>{call_id}</code> не найден или уже завершен.", parse_mode=ParseMode.HTML)
+            else:
+                await message.answer("Функция завершения звонка недоступна.", parse_mode=ParseMode.HTML)
         except Exception as e:
             logger.error(f"Ошибка сброса звонка: {e}", exc_info=True)
             await message.answer(f"Не удалось сбросить звонок: {e}")
@@ -132,3 +143,8 @@ class TelegramBot:
     async def start(self):
         logger.info("Starting Telegram bot polling...")
         await self.dp.start_polling(self.bot)
+
+    async def stop(self):
+        logger.info("Stopping Telegram bot...")
+        if self.bot:
+            await self.bot.session.close()
