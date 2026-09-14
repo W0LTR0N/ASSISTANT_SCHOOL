@@ -27,7 +27,7 @@ def clean_phone(phone: str) -> str:
 class TelegramBot:
     def __init__(self, sip_worker, db: Database):
         self.sip_worker = sip_worker
-        self.db = db  # Используем только переданную инициализированную БД
+        self.db = db
        
         config_obj = getattr(config, 'config', getattr(config, 'Config', config))
         bot_token = getattr(config_obj, 'TELEGRAM_BOT_TOKEN', None)
@@ -80,19 +80,15 @@ class TelegramBot:
         await message.answer(f"Инициирую звонок ({label}) на <b>{phone}</b>...", parse_mode=ParseMode.HTML)
        
         try:
-            # ИСПРАВЛЕНО: вызываем originate_call вместо несуществующего make_call
+            # originate_call УЖЕ создаёт запись в БД внутри себя!
+            # Не нужно вызывать self.db.create_call() повторно
             call_id = await self.sip_worker.originate_call(phone=phone, scenario=scenario)
             
             if not call_id:
                 await message.answer("❌ Не удалось инициировать звонок (возможно, достигнут лимит или ошибка SIP).")
                 return
 
-            await self.db.create_call(
-                call_id=call_id,
-                direction="outbound",
-                scenario=scenario,
-                phone=phone
-            )
+            # ИСПРАВЛЕНО: убран повторный вызов create_call — он уже вызван внутри originate_call
             await message.answer(f"✅ Звонок пошел!\nCall ID: <code>{call_id}</code>", parse_mode=ParseMode.HTML)
         except Exception as e:
             logger.error(f"Ошибка вызова: {e}", exc_info=True)
