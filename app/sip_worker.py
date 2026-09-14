@@ -1,6 +1,6 @@
 """
 SIP Worker — телефония через Plusofon (SIP UDP + RTP UDP).
-Исправлены: CSeq, SDP CRLF, медиа-прокси, защита от дублей 401.
+Исправлена race condition при инициализации transport.
 """
 
 import asyncio
@@ -106,8 +106,6 @@ class RTPProtocol(asyncio.DatagramProtocol):
         if not self.active or len(data) < 12: return
         
         self.last_packet_time = time.monotonic()
-        
-        # ИСПРАВЛЕНИЕ: Не дропаем по IP, так как Plusofon использует медиа-прокси
         version = (data[0] >> 6) & 0x3
         if version != 2: return
 
@@ -190,6 +188,8 @@ class SIPProtocol(asyncio.DatagramProtocol):
 
     def connection_made(self, transport):
         self.transport = transport
+        # ИСПРАВЛЕНИЕ: Устанавливаем transport в worker ДО вызова _on_udp_connected
+        self.worker.sip_transport = transport
         logger.info("[SIP] UDP transport bound successfully. Initiating REGISTER...")
         self.worker._on_udp_connected()
 
@@ -265,7 +265,6 @@ class SIPWorker:
         for pt in codecs:
             lines.append(f"a=rtpmap:{pt} {'PCMA' if pt == 8 else 'PCMU'}/8000")
         lines.append("a=sendrecv")
-        # ИСПРАВЛЕНИЕ: SDP использует CRLF
         return "\r\n".join(lines) + "\r\n"
 
     def parse_sdp_remote_media(self, msg):
@@ -867,6 +866,7 @@ class SIPWorker:
                 lambda: SIPProtocol(self),
                 local_addr=('0.0.0.0', self.port)
             )
+            # Дублирующее присвоение на всякий случай, хотя оно уже сделано в connection_made
             self.sip_transport = transport
             logger.info("[SIP] UDP socket bound to 0.0.0.0:%d", self.port)
         except Exception as e:
@@ -875,7 +875,6 @@ class SIPWorker:
         
         self._refresh_task = asyncio.create_task(self._register_refresh_loop())
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-        
         logger.info("[SIP] Worker started.")
 
     async def _heartbeat_loop(self):
