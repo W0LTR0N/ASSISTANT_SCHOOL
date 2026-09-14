@@ -833,32 +833,42 @@ class SIPWorker:
         session["voice_engine_task"] = asyncio.create_task(self.voice_engine.start(call_id, session))
 
     async def originate_call(self, phone, scenario="BEFORE_LESSON", metadata=None):
+        logger.info(" originate_call STARTED: phone=%s, scenario=%s", phone, scenario)
+        
         if scenario not in ("BEFORE_LESSON", "AFTER_LESSON"):
             logger.error("Invalid scenario: %s", scenario)
             return None
         
         active_count = len(self.get_active_calls())
+        logger.info("Active calls: %d / %d", active_count, self.max_concurrent_calls)
+        
         if active_count >= self.max_concurrent_calls:
             logger.warning("Max concurrent calls reached: %d", active_count)
             return None
         
+        logger.info("Reserving RTP port...")
         rtp_port = await self.reserve_port()
         if rtp_port is None:
             logger.error("No free RTP ports for outbound call")
             return None
+        logger.info("✅ RTP port reserved: %d", rtp_port)
 
+        logger.info("Binding RTP socket...")
         sock = await self._bind_rtp_socket(rtp_port)
         if sock is None:
             self.release_port(rtp_port)
             logger.error("Cannot bind RTP port %d for outbound", rtp_port)
             return None
+        logger.info("✅ RTP socket bound successfully")
 
         timestamp = int(time.time() * 1000)
         unique_id = str(uuid.uuid4())[:8]
         call_id = f"{timestamp}{unique_id}@{PUBLIC_IP}"
+        logger.info("Generated call_id: %s", call_id)
         
         try:
             metadata_json = json.dumps(metadata) if metadata else None
+            logger.info("Creating call record in database...")
             await self.database.create_call(
                 call_id=call_id,
                 direction="outbound",
@@ -866,12 +876,14 @@ class SIPWorker:
                 phone=phone,
                 metadata=metadata_json,
             )
+            logger.info("✅ Call record created successfully")
         except Exception as e:
             logger.error("Failed to create call record: %s", e)
             sock.close()
             self.release_port(rtp_port)
             return None
         
+        logger.info("Creating session dictionary...")
         session = {
             "call_id": call_id, "direction": "outbound", "scenario": scenario,
             "state": "CREATED", "cleanup_state": CLEANUP_STATES["NOT_STARTED"],
@@ -891,10 +903,16 @@ class SIPWorker:
             "_lead_sent": False, "terminate_lock": asyncio.Lock(), "rtp_lock": asyncio.Lock(),
         }
         self.sessions[call_id] = session
+        logger.info("✅ Session created, building INVITE...")
 
         invite = self._build_outbound_invite(session)
+        logger.info("INVITE built, length=%d bytes", len(invite))
+        logger.debug("INVITE message:\n%s", invite[:500])
         
+        logger.info("📤 Sending INVITE to %s:%d...", self.host, self.port)
         sent = await self._send_sip_message(invite)
+        logger.info("INVITE send result: %s", "✅ SUCCESS" if sent else "❌ FAILED")
+        
         if not sent:
             logger.error("Failed to send INVITE for call_id=%s", call_id)
             sock.close()
@@ -907,17 +925,24 @@ class SIPWorker:
             return None
         
         session["state"] = "DIALING"
+        logger.info("✅ INVITE sent, state=DIALING")
         
         try:
             await self.database.update_call_status(call_id, "DIALING")
+            logger.info("✅ Call status updated to DIALING in database")
         except Exception as e:
             logger.error("Failed to update call status: %s", e)
 
+        logger.info("Registering SIP transaction for retransmission...")
         tx = await self._register_transaction(invite, (self.host, self.port), is_invite=True)
         if tx:
+            logger.info("✅ Transaction registered, starting retransmission timer...")
             asyncio.create_task(self._start_retransmission(tx))
 
+        logger.info("Creating outbound timeout task...")
         session["timeout_task"] = asyncio.create_task(self._outbound_timeout(call_id))
+        
+        logger.info("✅ originate_call COMPLETED successfully, returning call_id=%s", call_id)
         return call_id
 
     async def _outbound_timeout(self, call_id):
