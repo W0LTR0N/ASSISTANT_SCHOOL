@@ -14,11 +14,17 @@ import config
 from database import Database
 from bot import TelegramBot
 from sip_worker import SIPWorker
+from integrations import Integrations
+from agent import Agent
 
+# Проверка имени файла: если у тебя файл называется voice_engine.py, замени 'voice' на 'voice_engine'
 try:
-    from voice_engine import VoiceEngine
+    from voice import VoiceEngine
 except ImportError:
-    VoiceEngine = None
+    try:
+        from voice_engine import VoiceEngine
+    except ImportError:
+        VoiceEngine = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,26 +50,31 @@ async def main():
    
     # 1. Единый экземпляр базы данных
     db = Database()
-
-    # 2. Инициализация соединения SQLite и таблиц
     await db.init()
 
-    # 3. Голосовой движок
-    voice_engine = VoiceEngine() if VoiceEngine else None
+    # 2. Инициализация внешних интеграций (Yandex, GenVoice, Albato)
+    integrations = Integrations()
 
-    # 4. Передача аргументов в SIPWorker
-    try:
-        sip_worker = SIPWorker(voice_engine, db, config)
-    except TypeError:
-        try:
-            sip_worker = SIPWorker(database=db, config=config)
-        except TypeError:
-            sip_worker = SIPWorker(db)
+    # 3. Инициализация Агента (требует integrations и db)
+    agent = Agent(integrations, db)
 
-    # 5. Строгая передача инициализированной БД в TelegramBot
+    # 4. Инициализация Голосового движка (требует integrations, db, agent)
+    if VoiceEngine is None:
+        logger.error("VoiceEngine not found! Check file name (voice.py or voice_engine.py)")
+        raise ImportError("VoiceEngine module not found")
+    
+    voice_engine = VoiceEngine(integrations, db, agent)
+
+    # 5. Инициализация SIP Worker (требует voice_engine, db, integrations)
+    # ИСПРАВЛЕНО: передаем реальный объект integrations, а не модуль config
+    sip_worker = SIPWorker(voice_engine, db, integrations)
+
+    # 6. Инициализация Telegram бота (требует sip_worker и db)
     bot = TelegramBot(sip_worker, db)
 
-    # 6. Запуск сервисов
+    logger.info("All components initialized successfully. Starting services...")
+
+    # 7. Запуск сервисов
     await asyncio.gather(
         run_fastapi(),
         bot.start(),
