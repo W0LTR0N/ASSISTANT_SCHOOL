@@ -1,6 +1,6 @@
 """
 SIP Worker — телефония через Plusofon (SIP UDP + RTP UDP).
-Финальная версия с исправленным cleanup, ACK, BYE и REGISTER.
+Финальная версия с исправленным race condition при старте, cleanup, ACK и BYE.
 """
 
 import asyncio
@@ -32,7 +32,6 @@ CLEANUP_STATES = {"NOT_STARTED": 0, "STARTED": 1, "RESOURCES_CLOSED": 2, "FINISH
 
 
 def parse_contact_uri(contact: str) -> Optional[str]:
-    """Парсит SIP URI из Contact header."""
     if not contact:
         return None
     m = re.search(r'<([^>]+)>', contact)
@@ -41,7 +40,6 @@ def parse_contact_uri(contact: str) -> Optional[str]:
 
 
 def parse_contact_address(contact: str) -> Optional[Tuple[str, int]]:
-    """Парсит host:port из Contact header для dialog target."""
     uri = parse_contact_uri(contact)
     if not uri:
         return None
@@ -65,7 +63,6 @@ def rtp_seq_lt(seq1: int, seq2: int) -> bool:
 
 
 def normalize_phone(phone: str) -> Optional[str]:
-    """Нормализация номера телефона. Возвращает None если номер невалидный."""
     if not phone:
         return None
     digits = re.sub(r'[^\d+]', '', phone)
@@ -212,6 +209,8 @@ class SIPProtocol(asyncio.DatagramProtocol):
 
     def connection_made(self, transport):
         self.transport = transport
+        # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: присваиваем transport ДО вызова REGISTER
+        self.worker.sip_transport = transport
         logger.info("[SIP] UDP transport bound successfully. Initiating REGISTER...")
         self.worker._on_udp_connected()
 
@@ -1056,8 +1055,8 @@ class SIPWorker:
             return
         
         current_task = asyncio.current_task()
-        
         session["cleanup_state"] = CLEANUP_STATES["STARTED"]
+        
         try:
             for key in ("voice_engine_task", "timeout_task", "keepalive_task", "bye_timeout_task", 
                         "cancel_timeout_task", "media_watchdog_task", "max_duration_task"):
@@ -1132,6 +1131,8 @@ class SIPWorker:
                 lambda: SIPProtocol(self),
                 local_addr=('0.0.0.0', self.port)
             )
+            # Примечание: self.sip_transport уже установлен внутри connection_made, 
+            # но оставляем здесь для страховки, если asyncio поменяет поведение.
             self.sip_transport = transport
             logger.info("[SIP] UDP socket bound successfully.")
         except Exception as e:
