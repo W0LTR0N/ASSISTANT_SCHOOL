@@ -1,6 +1,7 @@
 """
 SIP Worker — телефония через Plusofon (SIP UDP + RTP UDP).
-Исправлена race condition при инициализации transport.
+Финальная версия: исправлена race condition, добавлен handle_invite, усилено логирование, 
+корректная обработка Digest Auth и входящих/исходящих SIP-методов.
 """
 
 import asyncio
@@ -104,35 +105,28 @@ class RTPProtocol(asyncio.DatagramProtocol):
 
     def datagram_received(self, data, addr):
         if not self.active or len(data) < 12: return
-        
         self.last_packet_time = time.monotonic()
         version = (data[0] >> 6) & 0x3
         if version != 2: return
-
         payload_type = data[1] & 0x7F
         if payload_type not in (0, 8): return
-
         cc = data[0] & 0x0F
         x_bit = (data[0] >> 4) & 0x1
         p_bit = (data[0] >> 5) & 0x1
         seq = struct.unpack("!H", data[2:4])[0]
-
         offset = 12 + cc * 4
         if x_bit and len(data) >= offset + 4:
             ext_len_words = struct.unpack("!H", data[offset + 2:offset + 4])[0]
             offset += 4 + ext_len_words * 4
         if offset > len(data): return
-
         payload = data[offset:]
         if p_bit and len(payload) > 0:
             pad_len = payload[-1]
             if pad_len == 0 or pad_len > len(payload): return
             payload = payload[:-pad_len]
-
         if self._last_rx_seq is not None:
             if seq == self._last_rx_seq or rtp_seq_lt(seq, self._last_rx_seq): return
         self._last_rx_seq = seq
-
         try:
             pcm_frame = audioop.alaw2lin(payload, 2) if payload_type == 8 else audioop.ulaw2lin(payload, 2)
             self.pcm_buffer.extend(pcm_frame)
@@ -188,7 +182,7 @@ class SIPProtocol(asyncio.DatagramProtocol):
 
     def connection_made(self, transport):
         self.transport = transport
-        # ИСПРАВЛЕНИЕ: Устанавливаем transport в worker ДО вызова _on_udp_connected
+        # ИСПРАВЛЕНИЕ: Устанавливаем transport в worker ДО вызова _on_udp_connected, чтобы избежать race condition
         self.worker.sip_transport = transport
         logger.info("[SIP] UDP transport bound successfully. Initiating REGISTER...")
         self.worker._on_udp_connected()
@@ -206,7 +200,8 @@ class SIPProtocol(asyncio.DatagramProtocol):
                 self.worker.handle_response(first_line, msg, addr)
                 return
             method = first_line.split(' ', 1)[0].upper()
-            if method == 'INVITE': asyncio.create_task(self.worker.handle_invite(msg, addr))
+            if method == 'INVITE':
+                asyncio.create_task(self.worker.handle_invite(msg, addr))
             elif method == 'ACK': self.worker.handle_ack(msg, addr)
             elif method == 'BYE': asyncio.create_task(self.worker.handle_bye(msg, addr))
             elif method == 'CANCEL': asyncio.create_task(self.worker.handle_cancel(msg, addr))
@@ -349,12 +344,13 @@ class SIPWorker:
         if auth_header: headers += f"{auth_header}\r\n"
         return headers + "Content-Length: 0\r\n\r\n"
 
-    async def _send_sip_message(self, sip_msg: str) -> bool:
+    async def _send_sip_message(self, sip_msg: str, target_addr: tuple = None) -> bool:
         if not self.sip_transport:
             logger.error("[SIP] Cannot send: UDP transport is not available")
             return False
         try:
-            self.sip_transport.sendto(sip_msg.encode('utf-8'), (self.host, self.port))
+            addr = target_addr if target_addr else (self.host, self.port)
+            self.sip_transport.sendto(sip_msg.encode('utf-8'), addr)
             return True
         except Exception as e:
             logger.exception("[SIP] Send error: %s", e)
@@ -421,6 +417,7 @@ class SIPWorker:
         self.is_connected = True
         self.registered = False
         self._register_challenge_pending = False
+        logger.info("[SIP] UDP connected successfully. Triggering REGISTER task...")
         asyncio.create_task(self.send_register())
 
     def _on_udp_disconnected(self):
@@ -430,13 +427,17 @@ class SIPWorker:
         logger.warning("[SIP] UDP disconnected.")
 
     async def send_register(self):
-        if not self.is_connected: return
+        logger.info("[SIP] send_register() executed. is_connected=%s", self.is_connected)
+        if not self.is_connected:
+            logger.warning("[SIP] Cannot send REGISTER: not connected")
+            return
         self._register_challenge_pending = False
         auth_header = self._compute_digest(self.auth_cache, proxy=self.auth_cache.get("_proxy", False)) if self.auth_cache else ""
         msg = self._build_register_message(auth_header)
         logger.info("[SIP] Sending REGISTER cseq=%d", self.register_cseq)
         if await self._send_sip_message(msg):
             self.register_cseq += 1
+            logger.info("[SIP] REGISTER packet dispatched to network.")
 
     async def _register_refresh_loop(self):
         while self.is_running:
@@ -466,12 +467,31 @@ class SIPWorker:
             self.register_cseq += 1
             self._register_challenge_pending = False
 
+    # --- ОБРАБОТКА ВХОДЯЩИХ ВЫЗОВОВ ---
+
+    async def handle_invite(self, msg, addr):
+        """Обработка входящего INVITE от Plusofon (отклоняем, так как работаем только на исходящие)."""
+        logger.info("[SIP] Received incoming INVITE from %s", addr)
+        call_id = self._extract_header(msg, "Call-ID") or ""
+        cseq = self._extract_header(msg, "CSeq") or ""
+        from_hdr = self._extract_header(msg, "From") or ""
+        to_hdr = self._extract_header(msg, "To") or ""
+        via_hdr = self._extract_header(msg, "Via") or ""
+        
+        trying = f"SIP/2.0 100 Trying\r\nVia: {via_hdr}\r\nFrom: {from_hdr}\r\nTo: {to_hdr}\r\nCall-ID: {call_id}\r\nCSeq: {cseq}\r\nContent-Length: 0\r\n\r\n"
+        await self._send_sip_message(trying, addr)
+        
+        busy = f"SIP/2.0 486 Busy Here\r\nVia: {via_hdr}\r\nFrom: {from_hdr}\r\nTo: {to_hdr}\r\nCall-ID: {call_id}\r\nCSeq: {cseq}\r\nContent-Length: 0\r\n\r\n"
+        await self._send_sip_message(busy, addr)
+        logger.info("[SIP] Sent 486 Busy Here for incoming INVITE")
+
     # --- ОБРАБОТКА ОТВЕТОВ ---
 
     def handle_response(self, first_line, msg, addr):
         parts = first_line.split()
         code = parts[1] if len(parts) > 1 else ""
         cseq = self._extract_header(msg, "CSeq") or ""
+        logger.info("[SIP] Received response: %s", first_line.strip())
         
         if code in ("401", "407"):
             logger.info("[SIP] Received %s", code)
@@ -585,7 +605,7 @@ class SIPWorker:
         lines.insert(insert_idx, auth_header)
         
         logger.info("[SIP] Sending INVITE with Authorization cseq=%d", session["invite_cseq"])
-        await self._send_sip_message("\r\n".join(lines))
+        await self._send_sip_message("\r\n".join(lines), addr)
 
     async def handle_invite_200(self, msg, call_id, addr):
         session = self.sessions.get(call_id)
@@ -594,7 +614,7 @@ class SIPWorker:
         async with session.get("rtp_lock"):
             if session["state"] in ("STOPPING", "ENDING", "ENDED", "BYE_SENT"):
                 ack, _ = self._build_ack(session)
-                await self._send_sip_message(ack)
+                await self._send_sip_message(ack, addr)
                 await self._cleanup_call(call_id, send_lead=False)
                 return
 
@@ -621,7 +641,7 @@ class SIPWorker:
 
             ack, _ = self._build_ack(session, contact, is_2xx=True)
             logger.info("[SIP] Sending ACK")
-            await self._send_sip_message(ack)
+            await self._send_sip_message(ack, addr)
 
             session["state"] = "ANSWERED"
             session["answered_at"] = time.time()
@@ -709,7 +729,7 @@ class SIPWorker:
             f"Call-ID: {call_id}\r\nCSeq: {session['invite_cseq']} CANCEL\r\n"
             f"Max-Forwards: 70\r\nContent-Length: 0\r\n\r\n"
         )
-        await self._send_sip_message(cancel)
+        await self._send_sip_message(cancel, session.get("signaling_addr"))
         session["state"] = "CANCEL_SENT"
         asyncio.create_task(self._cancel_timeout(call_id))
 
@@ -723,7 +743,7 @@ class SIPWorker:
         session = self.sessions.get(call_id)
         if not session: return
         ack, _ = self._build_ack(session, is_2xx=False)
-        await self._send_sip_message(ack)
+        await self._send_sip_message(ack, addr)
         await self._cleanup_call(call_id, send_lead=False)
 
     async def handle_invite_error(self, msg, call_id, code, addr=None):
@@ -732,7 +752,7 @@ class SIPWorker:
         session["sip_code"] = code
         session["hangup_reason"] = f"error_{code}"
         ack, _ = self._build_ack(session, is_2xx=False)
-        await self._send_sip_message(ack)
+        await self._send_sip_message(ack, addr)
         await self._cleanup_call(call_id, send_lead=False)
 
     def handle_ack(self, msg, addr): pass 
@@ -742,7 +762,7 @@ class SIPWorker:
         session = self.sessions.get(call_id)
         if not session: return
         resp = f"SIP/2.0 200 OK\r\nVia: {self._extract_header(msg, 'Via') or ''}\r\nFrom: {self._extract_header(msg, 'From') or ''}\r\nTo: {self._extract_header(msg, 'To') or ''}\r\nCall-ID: {call_id}\r\nCSeq: {self._extract_header(msg, 'CSeq') or ''}\r\nContent-Length: 0\r\n\r\n"
-        await self._send_sip_message(resp)
+        await self._send_sip_message(resp, addr)
         session["hangup_reason"] = "remote_hangup"
         await self._cleanup_call(call_id, send_lead=True)
 
@@ -751,9 +771,9 @@ class SIPWorker:
         session = self.sessions.get(call_id)
         if not session or session["state"] not in ("CREATED", "DIALING", "RINGING"): return
         ok = f"SIP/2.0 200 OK\r\nVia: {self._extract_header(msg, 'Via') or ''}\r\nFrom: {self._extract_header(msg, 'From') or ''}\r\nTo: {self._extract_header(msg, 'To') or ''}\r\nCall-ID: {call_id}\r\nCSeq: {self._extract_header(msg, 'CSeq') or ''}\r\nContent-Length: 0\r\n\r\n"
-        await self._send_sip_message(ok)
+        await self._send_sip_message(ok, addr)
         req_term = f"SIP/2.0 487 Request Terminated\r\nVia: {self._extract_header(msg, 'Via') or ''}\r\nFrom: {self._extract_header(msg, 'From') or ''}\r\nTo: {session['to_hdr']}\r\nCall-ID: {call_id}\r\nCSeq: {session['invite_cseq']}\r\nContent-Length: 0\r\n\r\n"
-        await self._send_sip_message(req_term)
+        await self._send_sip_message(req_term, addr)
         session["hangup_reason"] = "remote_cancel"
         await self._cleanup_call(call_id, send_lead=False)
 
@@ -764,7 +784,7 @@ class SIPWorker:
         to_hdr = self._extract_header(msg, "To") or ""
         if ";tag=" not in to_hdr.lower(): to_hdr = f"{to_hdr};tag={random.randint(1000,9999)}"
         response = f"SIP/2.0 200 OK\r\nVia: {self._extract_header(msg, 'Via') or ''}\r\nFrom: {from_hdr}\r\nTo: {to_hdr}\r\nCall-ID: {call_id}\r\nCSeq: {cseq}\r\nContact: <sip:{self.user}@{PUBLIC_IP}:{self.port}>\r\nAllow: INVITE, ACK, BYE, CANCEL, OPTIONS\r\nContent-Length: 0\r\n\r\n"
-        asyncio.create_task(self._send_sip_message(response))
+        asyncio.create_task(self._send_sip_message(response, addr))
 
     async def send_bye(self, session):
         uri = parse_contact_uri(session.get("remote_contact")) or self._build_outbound_ruri(session["phone"])
@@ -781,7 +801,7 @@ class SIPWorker:
         )
         session["bye_cseq"] += 1
         session["state"] = "BYE_SENT"
-        await self._send_sip_message(bye)
+        await self._send_sip_message(bye, session.get("signaling_addr"))
         session["bye_timeout_task"] = asyncio.create_task(self._bye_timeout(session["call_id"]))
 
     async def _bye_timeout(self, call_id):
@@ -862,15 +882,15 @@ class SIPWorker:
             loop.add_signal_handler(sig, lambda: asyncio.create_task(self.graceful_stop()))
         
         try:
+            logger.info("[SIP] Attempting to bind UDP socket to 0.0.0.0:%d", self.port)
             transport, protocol = await loop.create_datagram_endpoint(
                 lambda: SIPProtocol(self),
                 local_addr=('0.0.0.0', self.port)
             )
-            # Дублирующее присвоение на всякий случай, хотя оно уже сделано в connection_made
             self.sip_transport = transport
-            logger.info("[SIP] UDP socket bound to 0.0.0.0:%d", self.port)
+            logger.info("[SIP] UDP socket bound successfully. Waiting for connection_made callback...")
         except Exception as e:
-            logger.error("[SIP] Failed to bind UDP transport: %s", e)
+            logger.error("[SIP] CRITICAL: Failed to bind UDP transport: %s", e)
             raise
         
         self._refresh_task = asyncio.create_task(self._register_refresh_loop())
