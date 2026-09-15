@@ -1,7 +1,6 @@
 """
 SIP Worker — телефония через Plusofon (SIP UDP + RTP UDP).
-Финальная версия: исправлена race condition, добавлен handle_invite, усилено логирование, 
-корректная обработка Digest Auth и входящих/исходящих SIP-методов.
+Финальная версия с исправленным cleanup, ACK, BYE и REGISTER.
 """
 
 import asyncio
@@ -16,16 +15,15 @@ import time
 import hashlib
 import uuid
 import audioop
-from dataclasses import dataclass
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 
 from config import (
-    PLUSOFON_SIP_HOST, PLUSOFON_SIP_PORT, PLUSOFON_SIP_USER, PLUSOFON_SIP_PASSWORD,
-    PUBLIC_IP, OUTBOUND_RURI_TEMPLATE, OUTBOUND_FROM_TEMPLATE,
+    PLUSOFON_SIP_HOST, PLUSOFON_SIP_USER, PLUSOFON_SIP_PASSWORD,
+    PUBLIC_IP,
     RTP_PORT_MIN, RTP_PORT_MAX, TRUSTED_SIP_IPS, BLACKLIST_SIP_IPS,
     HEARTBEAT_INTERVAL, HEARTBEAT_FILE, SIP_CAN_START,
     MAX_CONCURRENT_CALLS, MAX_CALL_DURATION, MEDIA_IDLE_TIMEOUT,
-    MAX_RTP_BUFFER_BYTES, SIP_TIMER_B, SIP_RATE_LIMIT_PER_IP, DEVELOPMENT_MODE,
+    MAX_RTP_BUFFER_BYTES, SIP_TIMER_B, SIP_RATE_LIMIT_PER_IP,
 )
 
 logger = logging.getLogger("sip_worker")
@@ -34,10 +32,25 @@ CLEANUP_STATES = {"NOT_STARTED": 0, "STARTED": 1, "RESOURCES_CLOSED": 2, "FINISH
 
 
 def parse_contact_uri(contact: str) -> Optional[str]:
-    if not contact: return None
+    """Парсит SIP URI из Contact header."""
+    if not contact:
+        return None
     m = re.search(r'<([^>]+)>', contact)
     uri = m.group(1).strip() if m else contact.split(';')[0].split()[0].strip()
     return uri if uri.startswith("sip:") or uri.startswith("sips:") else None
+
+
+def parse_contact_address(contact: str) -> Optional[Tuple[str, int]]:
+    """Парсит host:port из Contact header для dialog target."""
+    uri = parse_contact_uri(contact)
+    if not uri:
+        return None
+    m = re.search(r'sip:[^@]*@([^:]+)(?::(\d+))?', uri)
+    if m:
+        host = m.group(1)
+        port = int(m.group(2)) if m.group(2) else 5060
+        return host, port
+    return None
 
 
 def parse_digest_challenge(header: str) -> dict:
@@ -51,17 +64,22 @@ def rtp_seq_lt(seq1: int, seq2: int) -> bool:
     return ((seq1 - seq2) & 0xFFFF) > 32768
 
 
-@dataclass
-class SIPTransaction:
-    branch: str
-    method: str
-    call_id: str
-    cseq: int
-    message: bytes
-    created_at: float
-    completed: bool = False
-    response_code: Optional[int] = None
-    is_invite: bool = False
+def normalize_phone(phone: str) -> Optional[str]:
+    """Нормализация номера телефона. Возвращает None если номер невалидный."""
+    if not phone:
+        return None
+    digits = re.sub(r'[^\d+]', '', phone)
+    if digits.startswith('+'):
+        digits = digits[1:]
+    if len(digits) == 11 and digits.startswith('8'):
+        digits = '7' + digits[1:]
+    elif len(digits) == 10:
+        digits = '7' + digits
+    elif len(digits) == 11 and not digits.startswith('7'):
+        return None
+    if len(digits) != 11 or not digits.startswith('7'):
+        return None
+    return digits
 
 
 class RateLimiter:
@@ -71,9 +89,11 @@ class RateLimiter:
     
     def allow(self, ip: str) -> bool:
         now = time.time()
-        if ip not in self._requests: self._requests[ip] = []
+        if ip not in self._requests:
+            self._requests[ip] = []
         self._requests[ip] = [t for t in self._requests[ip] if now - t < 60]
-        if len(self._requests[ip]) >= self.max_per_minute: return False
+        if len(self._requests[ip]) >= self.max_per_minute:
+            return False
         self._requests[ip].append(now)
         return True
 
@@ -98,34 +118,40 @@ class RTPProtocol(asyncio.DatagramProtocol):
         self._last_rx_seq = None
 
     def set_codec(self, payload_type):
-        if payload_type in (0, 8): self.negotiated_codec = payload_type
+        if payload_type in (0, 8):
+            self.negotiated_codec = payload_type
 
-    def connection_made(self, transport): self.transport = transport
-    def connection_lost(self, exc): self.active = False
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def connection_lost(self, exc):
+        self.active = False
 
     def datagram_received(self, data, addr):
-        if not self.active or len(data) < 12: return
+        if not self.active or len(data) < 12:
+            return
         self.last_packet_time = time.monotonic()
-        version = (data[0] >> 6) & 0x3
-        if version != 2: return
+        if (data[0] >> 6) & 0x3 != 2:
+            return
         payload_type = data[1] & 0x7F
-        if payload_type not in (0, 8): return
+        if payload_type not in (0, 8):
+            return
         cc = data[0] & 0x0F
         x_bit = (data[0] >> 4) & 0x1
         p_bit = (data[0] >> 5) & 0x1
         seq = struct.unpack("!H", data[2:4])[0]
         offset = 12 + cc * 4
         if x_bit and len(data) >= offset + 4:
-            ext_len_words = struct.unpack("!H", data[offset + 2:offset + 4])[0]
-            offset += 4 + ext_len_words * 4
-        if offset > len(data): return
+            offset += 4 + struct.unpack("!H", data[offset + 2:offset + 4])[0] * 4
+        if offset > len(data):
+            return
         payload = data[offset:]
         if p_bit and len(payload) > 0:
             pad_len = payload[-1]
-            if pad_len == 0 or pad_len > len(payload): return
-            payload = payload[:-pad_len]
-        if self._last_rx_seq is not None:
-            if seq == self._last_rx_seq or rtp_seq_lt(seq, self._last_rx_seq): return
+            if 0 < pad_len <= len(payload):
+                payload = payload[:-pad_len]
+        if self._last_rx_seq is not None and (seq == self._last_rx_seq or rtp_seq_lt(seq, self._last_rx_seq)):
+            return
         self._last_rx_seq = seq
         try:
             pcm_frame = audioop.alaw2lin(payload, 2) if payload_type == 8 else audioop.ulaw2lin(payload, 2)
@@ -136,7 +162,8 @@ class RTPProtocol(asyncio.DatagramProtocol):
             logger.error("RTP decode error call_id=%s: %s", self.call_id, e)
 
     async def send_pcm(self, pcm_data):
-        if not self.remote_target or not pcm_data: return
+        if not self.remote_target or not pcm_data:
+            return
         self.speaking = True
         try:
             pt = 0x08 if self.negotiated_codec == 8 else 0x00
@@ -145,7 +172,8 @@ class RTPProtocol(asyncio.DatagramProtocol):
             start_time = time.monotonic()
             for i in range(0, len(pcm_data), frame_bytes):
                 chunk = pcm_data[i:i + frame_bytes]
-                if len(chunk) < frame_bytes: chunk = chunk + b'\x00' * (frame_bytes - len(chunk))
+                if len(chunk) < frame_bytes:
+                    chunk = chunk + b'\x00' * (frame_bytes - len(chunk))
                 encoded = encode_func(chunk, 2)
                 marker = 0x80 if i == 0 else 0x00
                 header = struct.pack("!BBHII", 0x80, marker | pt, self.sequence_number & 0xFFFF,
@@ -157,12 +185,14 @@ class RTPProtocol(asyncio.DatagramProtocol):
                 except Exception:
                     break
                 delay = start_time + (i // frame_bytes + 1) * 0.02 - time.monotonic()
-                if delay > 0: await asyncio.sleep(delay)
+                if delay > 0:
+                    await asyncio.sleep(delay)
         finally:
             self.speaking = False
 
     def send_keepalive(self):
-        if not self.transport or not self.remote_target or self.speaking or not self.active: return
+        if not self.transport or not self.remote_target or self.speaking or not self.active:
+            return
         pt = 0x08 if self.negotiated_codec == 8 else 0x00
         payload = b'\xd5' * 160 if self.negotiated_codec == 8 else b'\xff' * 160
         header = struct.pack("!BBHII", 0x80, pt, self.sequence_number & 0xFFFF,
@@ -182,18 +212,18 @@ class SIPProtocol(asyncio.DatagramProtocol):
 
     def connection_made(self, transport):
         self.transport = transport
-        # ИСПРАВЛЕНИЕ: Устанавливаем transport в worker ДО вызова _on_udp_connected, чтобы избежать race condition
-        self.worker.sip_transport = transport
         logger.info("[SIP] UDP transport bound successfully. Initiating REGISTER...")
         self.worker._on_udp_connected()
 
     def connection_lost(self, exc):
-        if exc: logger.warning("[SIP] UDP connection lost: %s", exc)
+        if exc:
+            logger.warning("[SIP] UDP connection lost: %s", exc)
         self.worker._on_udp_disconnected()
 
     def datagram_received(self, data, addr):
         try:
-            if not self.worker.rate_limiter.allow(addr[0]): return
+            if not self.worker.rate_limiter.allow(addr[0]):
+                return
             msg = data.decode('utf-8', errors='ignore')
             first_line = msg.split('\r\n', 1)[0]
             if first_line.startswith('SIP/2.0'):
@@ -202,10 +232,18 @@ class SIPProtocol(asyncio.DatagramProtocol):
             method = first_line.split(' ', 1)[0].upper()
             if method == 'INVITE':
                 asyncio.create_task(self.worker.handle_invite(msg, addr))
-            elif method == 'ACK': self.worker.handle_ack(msg, addr)
-            elif method == 'BYE': asyncio.create_task(self.worker.handle_bye(msg, addr))
-            elif method == 'CANCEL': asyncio.create_task(self.worker.handle_cancel(msg, addr))
-            elif method == 'OPTIONS': self.worker.handle_options(msg, addr)
+            elif method == 'ACK':
+                cid = self.worker._extract_header(msg, "Call-ID") or "?"
+                logger.info(f"[{cid}] ACK received, dialog confirmed")
+                session = self.worker.sessions.get(cid)
+                if session:
+                    session["confirmed"] = True
+            elif method == 'BYE':
+                asyncio.create_task(self.worker.handle_bye(msg, addr))
+            elif method == 'CANCEL':
+                asyncio.create_task(self.worker.handle_cancel(msg, addr))
+            elif method == 'OPTIONS':
+                self.worker.handle_options(msg, addr)
         except Exception as e:
             logger.exception("SIP message processing error: %s", e)
 
@@ -213,7 +251,7 @@ class SIPProtocol(asyncio.DatagramProtocol):
 class SIPWorker:
     def __init__(self, voice_engine, database, integrations):
         self.host = PLUSOFON_SIP_HOST
-        self.port = PLUSOFON_SIP_PORT
+        self.port = 5060
         self.user = PLUSOFON_SIP_USER
         self.password = PLUSOFON_SIP_PASSWORD
         
@@ -223,11 +261,14 @@ class SIPWorker:
         self.registered = False
         
         self.sessions: Dict[str, dict] = {}
+        self.pending_byes: Dict[str, dict] = {}
         self.used_ports = set()
         self._last_allocated_port = RTP_PORT_MIN
         self._port_lock = asyncio.Lock()
         
         self.register_cseq = 1
+        self.register_call_id = f"{random.randint(100000,999999)}@{self.host}"
+        self.register_from_tag = f"tag{random.randint(100000,999999)}"
         self.auth_cache = None
         self._register_challenge_pending = False
         
@@ -242,54 +283,50 @@ class SIPWorker:
 
     async def reserve_port(self):
         async with self._port_lock:
-            for _ in range(RTP_PORT_MAX - RTP_PORT_MIN + 1):
+            total_ports = RTP_PORT_MAX - RTP_PORT_MIN + 1
+            for _ in range(total_ports):
                 port = self._last_allocated_port
-                self._last_allocated_port = RTP_PORT_MIN if self._last_allocated_port >= RTP_PORT_MAX else self._last_allocated_port + 1
+                self._last_allocated_port += 1
+                if self._last_allocated_port > RTP_PORT_MAX:
+                    self._last_allocated_port = RTP_PORT_MIN
                 if port not in self.used_ports:
                     self.used_ports.add(port)
                     return port
             return None
 
-    def release_port(self, port): self.used_ports.discard(port)
+    def release_port(self, port):
+        self.used_ports.discard(port)
 
-    def generate_sdp(self, rtp_port, codecs=None):
-        codecs = codecs or [0, 8]
-        lines = ["v=0", f"o=- {int(time.time())} 1 IN IP4 {PUBLIC_IP}", "s=-",
-                f"c=IN IP4 {PUBLIC_IP}", "t=0 0",
-                f"m=audio {rtp_port} RTP/AVP {' '.join(map(str, codecs))}"]
-        for pt in codecs:
-            lines.append(f"a=rtpmap:{pt} {'PCMA' if pt == 8 else 'PCMU'}/8000")
-        lines.append("a=sendrecv")
-        return "\r\n".join(lines) + "\r\n"
+    def generate_sdp(self, rtp_port):
+        return f"v=0\r\no=- {int(time.time())} 1 IN IP4 {PUBLIC_IP}\r\ns=-\r\nc=IN IP4 {PUBLIC_IP}\r\nt=0 0\r\nm=audio {rtp_port} RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\na=sendrecv\r\n"
 
     def parse_sdp_remote_media(self, msg):
         session_ip = media_ip = port = None
         in_media = False
         supported_codecs = []
         for line in msg.splitlines():
-            line = line.strip()
             if line.startswith("c=IN IP4"):
-                parts = line.split()
-                if len(parts) >= 3:
-                    if in_media: media_ip = parts[2]
-                    else: session_ip = parts[2]
+                if in_media:
+                    media_ip = line.split()[2]
+                else:
+                    session_ip = line.split()[2]
             elif line.startswith("m=audio"):
                 in_media = True
-                parts = line.split()
-                if len(parts) >= 3:
+                try:
+                    port = int(line.split()[1])
+                except Exception:
+                    port = None
+                for pt_str in line.split()[3:]:
                     try:
-                        port = int(parts[1])
-                        if port == 0: port = None
-                    except ValueError: port = None
-                    for pt_str in parts[3:]:
-                        try:
-                            pt = int(pt_str)
-                            if pt in (0, 8): supported_codecs.append(pt)
-                        except ValueError: pass
-            elif line.startswith("m=video") or line.startswith("m=application"):
-                in_media = False
-        if port is None or not supported_codecs: return None, None, None
-        return (media_ip or session_ip), port, supported_codecs[0]
+                        pt = int(pt_str)
+                        if pt in (0, 8):
+                            supported_codecs.append(pt)
+                    except ValueError:
+                        pass
+        if port is None or not supported_codecs:
+            return None, None, None
+        codec = 8 if 8 in supported_codecs else (0 if 0 in supported_codecs else supported_codecs[0])
+        return (media_ip or session_ip), port, codec
 
     def _extract_header(self, msg, header_name):
         match = re.search(rf'^{header_name}:\s*(.+)$', msg, re.MULTILINE | re.IGNORECASE)
@@ -319,14 +356,17 @@ class SIPWorker:
             response = hashlib.md5(f"{ha1}:{nonce}:{ha2}".encode()).hexdigest()
             auth_header = f'{header_name}: Digest username="{self.user}", realm="{realm}", nonce="{nonce}", uri="{uri}", response="{response}"'
 
-        if "opaque" in auth_data: auth_header += f', opaque="{auth_data["opaque"]}"'
+        if "opaque" in auth_data:
+            auth_header += f', opaque="{auth_data["opaque"]}"'
         return auth_header
 
     def _parse_auth_challenge(self, msg):
         m = re.search(r'Proxy-Authenticate:\s*Digest\s+(.*)', msg, re.I)
-        if m: return parse_digest_challenge(m.group(1).strip()), True
+        if m:
+            return parse_digest_challenge(m.group(1).strip()), True
         m = re.search(r'WWW-Authenticate:\s*Digest\s+(.*)', msg, re.I)
-        if m: return parse_digest_challenge(m.group(1).strip()), False
+        if m:
+            return parse_digest_challenge(m.group(1).strip()), False
         return None, False
 
     def _build_register_message(self, auth_header=None):
@@ -334,14 +374,15 @@ class SIPWorker:
         headers = (
             f"REGISTER sip:{self.host} SIP/2.0\r\n"
             f"Via: SIP/2.0/UDP {PUBLIC_IP}:{self.port};branch={branch}\r\n"
-            f"From: <sip:{self.user}@{self.host}>;tag=reg{random.randint(100000,999999)}\r\n"
+            f"From: <sip:{self.user}@{self.host}>;tag={self.register_from_tag}\r\n"
             f"To: <sip:{self.user}@{self.host}>\r\n"
-            f"Call-ID: {self.user}@{PUBLIC_IP}\r\n"
+            f"Call-ID: {self.register_call_id}\r\n"
             f"CSeq: {self.register_cseq} REGISTER\r\n"
             f"Contact: <sip:{self.user}@{PUBLIC_IP}:{self.port}>\r\n"
-            f"Max-Forwards: 70\r\nExpires: 300\r\n"
+            f"Max-Forwards: 70\r\nExpires: 120\r\n"
         )
-        if auth_header: headers += f"{auth_header}\r\n"
+        if auth_header:
+            headers += f"{auth_header}\r\n"
         return headers + "Content-Length: 0\r\n\r\n"
 
     async def _send_sip_message(self, sip_msg: str, target_addr: tuple = None) -> bool:
@@ -349,7 +390,13 @@ class SIPWorker:
             logger.error("[SIP] Cannot send: UDP transport is not available")
             return False
         try:
-            addr = target_addr if target_addr else (self.host, self.port)
+            if target_addr:
+                addr = target_addr
+            else:
+                loop = asyncio.get_running_loop()
+                infos = await loop.getaddrinfo(self.host, 5060, type=socket.SOCK_DGRAM)
+                target_ip = infos[0][4][0]
+                addr = (target_ip, 5060)
             self.sip_transport.sendto(sip_msg.encode('utf-8'), addr)
             return True
         except Exception as e:
@@ -357,17 +404,23 @@ class SIPWorker:
             return False
 
     def _build_outbound_ruri(self, phone):
-        return OUTBOUND_RURI_TEMPLATE.format(phone=phone, host=self.host)
+        normalized = normalize_phone(phone)
+        if not normalized:
+            logger.error(f"[SIP] Invalid phone number: {phone}")
+            return None
+        return f"sip:{normalized}@{self.host}"
 
     def _build_outbound_from(self):
-        return OUTBOUND_FROM_TEMPLATE.format(user=self.user, host=self.host)
+        return f"<sip:{self.user}@{self.host}>"
 
     def _build_outbound_invite(self, session):
         ruri = self._build_outbound_ruri(session["phone"])
+        if not ruri:
+            return None
         from_hdr = f"{self._build_outbound_from()};tag={session['from_tag']}"
         to_hdr = f"<sip:{session['phone']}@{self.host}>"
         branch = session["via_branch"]
-        sdp_body = self.generate_sdp(session["rtp_port"], codecs=[0, 8])
+        sdp_body = self.generate_sdp(session["rtp_port"])
         sdp_bytes = sdp_body.encode('utf-8')
         invite = (
             f"INVITE {ruri} SIP/2.0\r\n"
@@ -384,12 +437,21 @@ class SIPWorker:
         return invite
 
     def _build_ack(self, session, contact=None, is_2xx=True):
-        branch = f"z9hG4bK{random.randint(100000,999999)}" if is_2xx else session["via_branch"]
-        ruri = parse_contact_uri(contact) if contact and is_2xx else self._build_outbound_ruri(session["phone"])
-        if not ruri: ruri = self._build_outbound_ruri(session["phone"])
+        if is_2xx:
+            branch = f"z9hG4bK{random.randint(100000,999999)}"
+            ruri = parse_contact_uri(contact) if contact else self._build_outbound_ruri(session["phone"])
+            if not ruri:
+                ruri = self._build_outbound_ruri(session["phone"])
+        else:
+            branch = session["via_branch"]
+            ruri = self._build_outbound_ruri(session["phone"])
+            if not ruri:
+                ruri = f"sip:{session['phone']}@{self.host}"
+        
         to_hdr = session["to_hdr"]
         if session["to_tag"] and ";tag=" not in to_hdr.lower():
             to_hdr = f"{to_hdr};tag={session['to_tag']}"
+        
         return (
             f"ACK {ruri} SIP/2.0\r\n"
             f"Via: SIP/2.0/UDP {PUBLIC_IP}:{self.port};branch={branch}\r\n"
@@ -404,14 +466,11 @@ class SIPWorker:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.bind(('0.0.0.0', port))
+            return sock
         except OSError as e:
             sock.close()
             logger.error("RTP bind failed port=%d: %s", port, e)
             return None
-        sock.setblocking(False)
-        return sock
-
-    # --- УПРАВЛЕНИЕ UDP И REGISTER ---
 
     def _on_udp_connected(self):
         self.is_connected = True
@@ -427,21 +486,22 @@ class SIPWorker:
         logger.warning("[SIP] UDP disconnected.")
 
     async def send_register(self):
-        logger.info("[SIP] send_register() executed. is_connected=%s", self.is_connected)
         if not self.is_connected:
             logger.warning("[SIP] Cannot send REGISTER: not connected")
             return
-        self._register_challenge_pending = False
+        if self._register_challenge_pending:
+            logger.warning("[SIP] REGISTER challenge pending, skipping refresh")
+            return
         auth_header = self._compute_digest(self.auth_cache, proxy=self.auth_cache.get("_proxy", False)) if self.auth_cache else ""
         msg = self._build_register_message(auth_header)
         logger.info("[SIP] Sending REGISTER cseq=%d", self.register_cseq)
         if await self._send_sip_message(msg):
             self.register_cseq += 1
-            logger.info("[SIP] REGISTER packet dispatched to network.")
+            logger.info("[SIP] REGISTER packet dispatched")
 
     async def _register_refresh_loop(self):
         while self.is_running:
-            await asyncio.sleep(240) 
+            await asyncio.sleep(45)
             if self.is_connected and self.registered:
                 logger.info("[SIP] Refreshing REGISTER...")
                 await self.send_register()
@@ -450,14 +510,19 @@ class SIPWorker:
         if self._register_challenge_pending:
             logger.warning("[SIP] Register challenge already pending, skipping duplicate 401")
             return
-        self._register_challenge_pending = True
         
+        msg_call_id = self._extract_header(msg, "Call-ID") or ""
+        if msg_call_id != self.register_call_id:
+            logger.warning(f"[SIP] REGISTER challenge Call-ID mismatch: {msg_call_id} != {self.register_call_id}")
+            return
+        
+        self._register_challenge_pending = True
         auth_data, proxy = self._parse_auth_challenge(msg)
         if not auth_data:
             logger.error("[SIP] REGISTER failed: No auth data in 401/407")
             self._register_challenge_pending = False
             return
-        logger.info("[SIP] Received 401. Sending authenticated REGISTER...")
+        logger.info("[SIP] Digest challenge received for REGISTER")
         self.auth_cache = auth_data
         self.auth_cache["_proxy"] = proxy
         auth_header = self._compute_digest(auth_data, proxy=proxy)
@@ -467,10 +532,7 @@ class SIPWorker:
             self.register_cseq += 1
             self._register_challenge_pending = False
 
-    # --- ОБРАБОТКА ВХОДЯЩИХ ВЫЗОВОВ ---
-
     async def handle_invite(self, msg, addr):
-        """Обработка входящего INVITE от Plusofon (отклоняем, так как работаем только на исходящие)."""
         logger.info("[SIP] Received incoming INVITE from %s", addr)
         call_id = self._extract_header(msg, "Call-ID") or ""
         cseq = self._extract_header(msg, "CSeq") or ""
@@ -485,45 +547,44 @@ class SIPWorker:
         await self._send_sip_message(busy, addr)
         logger.info("[SIP] Sent 486 Busy Here for incoming INVITE")
 
-    # --- ОБРАБОТКА ОТВЕТОВ ---
-
     def handle_response(self, first_line, msg, addr):
         parts = first_line.split()
         code = parts[1] if len(parts) > 1 else ""
         cseq = self._extract_header(msg, "CSeq") or ""
-        logger.info("[SIP] Received response: %s", first_line.strip())
+        call_id = self._extract_header(msg, "Call-ID") or ""
+        logger.info("[SIP] Received %s for call_id=%s", first_line.strip(), call_id)
+        
+        session = self.sessions.get(call_id)
+        if session and session.get("signaling_addr") is None:
+            session["signaling_addr"] = addr
         
         if code in ("401", "407"):
-            logger.info("[SIP] Received %s", code)
-            if "REGISTER" in cseq: asyncio.create_task(self.handle_register_challenge(msg))
+            if "REGISTER" in cseq:
+                asyncio.create_task(self.handle_register_challenge(msg))
             elif "INVITE" in cseq:
-                call_id = self._extract_header(msg, "Call-ID") or ""
                 asyncio.create_task(self.handle_invite_challenge(msg, call_id, addr))
+            elif "BYE" in cseq:
+                asyncio.create_task(self.handle_bye_challenge(msg, call_id))
         elif code == "200":
-            logger.info("[SIP] Received 200 OK")
             if "REGISTER" in cseq:
                 self.registered = True
                 self._register_challenge_pending = False
-                logger.info("[SIP] REGISTERED")
+                logger.info("[SIP] SIP account REGISTERED")
             elif "INVITE" in cseq:
-                call_id = self._extract_header(msg, "Call-ID") or ""
                 asyncio.create_task(self.handle_invite_200(msg, call_id, addr))
+            elif "BYE" in cseq:
+                self.pending_byes.pop(call_id, None)
+                if session:
+                    asyncio.create_task(self._cleanup_call(call_id, send_lead=True))
         elif code in ("100", "180", "183"):
-            logger.info("[SIP] Received %s", code)
-            call_id = self._extract_header(msg, "Call-ID") or ""
-            session = self.sessions.get(call_id)
             if session and session["direction"] == "outbound" and code != "100":
                 session["state"] = "RINGING"
+                logger.info(f"[CALL] {call_id} state: RINGING ({code})")
         elif code == "487":
-            call_id = self._extract_header(msg, "Call-ID") or ""
             asyncio.create_task(self.handle_invite_487(msg, call_id, addr))
         elif code and code[0] in ("4", "5", "6"):
-            logger.info("[SIP] Received error %s", code)
             if "INVITE" in cseq:
-                call_id = self._extract_header(msg, "Call-ID") or ""
                 asyncio.create_task(self.handle_invite_error(msg, call_id, code, addr))
-
-    # --- ИСХОДЯЩИЙ ВЫЗОВ ---
 
     async def originate_call(self, phone, scenario="BEFORE_LESSON", metadata=None):
         if not self.is_connected:
@@ -533,40 +594,63 @@ class SIPWorker:
             logger.error("[SIP] Cannot call: SIP account NOT REGISTERED")
             return None
 
-        if scenario not in ("BEFORE_LESSON", "AFTER_LESSON"): return None
-        if len(self.get_active_calls()) >= self.max_concurrent_calls: return None
+        if scenario not in ("BEFORE_LESSON", "AFTER_LESSON"):
+            return None
+        if len(self.get_active_calls()) >= self.max_concurrent_calls:
+            return None
+        
+        normalized_phone = normalize_phone(phone)
+        if not normalized_phone:
+            logger.error(f"[SIP] Invalid phone number format: {phone}")
+            return None
         
         rtp_port = await self.reserve_port()
-        if rtp_port is None: return None
+        if rtp_port is None:
+            logger.error("[SIP] No available RTP ports")
+            return None
 
         sock = await self._bind_rtp_socket(rtp_port)
         if sock is None:
             self.release_port(rtp_port)
-            return None
+            for retry in range(5):
+                rtp_port = await self.reserve_port()
+                if rtp_port is None:
+                    break
+                sock = await self._bind_rtp_socket(rtp_port)
+                if sock:
+                    break
+                self.release_port(rtp_port)
+            if sock is None:
+                logger.error("[SIP] Failed to bind RTP port after retries")
+                return None
 
         call_id = f"{int(time.time() * 1000)}{str(uuid.uuid4())[:8]}@{PUBLIC_IP}"
         
         try:
-            await self.database.create_call(call_id=call_id, direction="outbound", scenario=scenario, phone=phone, metadata=json.dumps(metadata) if metadata else None)
+            await self.database.create_call(call_id=call_id, direction="outbound", scenario=scenario, 
+                                          phone=normalized_phone, metadata=json.dumps(metadata) if metadata else None)
         except Exception as e:
             logger.error("DB error: %s", e)
             sock.close()
             self.release_port(rtp_port)
             return None
         
+        from_tag = f"tag{random.randint(100000, 999999)}"
         session = {
             "call_id": call_id, "direction": "outbound", "scenario": scenario,
             "state": "CREATED", "cleanup_state": CLEANUP_STATES["NOT_STARTED"],
-            "phone": phone, "rtp_port": rtp_port, "rtp_bound_sock": sock,
+            "phone": normalized_phone, "rtp_port": rtp_port, "rtp_bound_sock": sock,
             "started_at": time.time(), "answered_at": None,
-            "from_tag": f"tag{random.randint(100000, 999999)}",
+            "from_tag": from_tag,
             "invite_cseq": 1, "bye_cseq": 1, "via_branch": f"z9hG4bK{random.randint(100000,999999)}",
             "to_tag": None, "from_hdr": None, "to_hdr": None, "remote_ip": None,
             "remote_port": None, "remote_target": None, "remote_contact": None,
-            "negotiated_codec": 8, "proto": None, "rtp_transport": None,
+            "dialog_target": None, "negotiated_codec": None, "proto": None, "rtp_transport": None,
             "signaling_addr": None, "confirmed": False, "stopped": False,
             "voice_engine_task": None, "timeout_task": None, "keepalive_task": None,
             "bye_timeout_task": None, "media_watchdog_task": None, "max_duration_task": None,
+            "cancel_timeout_task": None,
+            "invite_auth_retries": 0,
             "metadata": metadata or {}, "auth_cache": None, "last_200": None, 
             "ack_branch": None, "ack_message": None, "hangup_reason": None, "sip_code": None, 
             "finish_called": False, "terminate_lock": asyncio.Lock(), "rtp_lock": asyncio.Lock(),
@@ -574,10 +658,16 @@ class SIPWorker:
         self.sessions[call_id] = session
 
         invite = self._build_outbound_invite(session)
-        logger.info("[SIP] Sending INVITE to %s", phone)
+        if not invite:
+            logger.error("[SIP] Failed to build INVITE for %s", normalized_phone)
+            await self._cleanup_call(call_id, send_lead=False)
+            return None
+        
+        logger.info(f"[CALL] {call_id} originate to {normalized_phone}")
+        logger.info(f"[CALL] {call_id} INVITE sent cseq={session['invite_cseq']}")
         
         if not await self._send_sip_message(invite):
-            logger.error("[SIP] Failed to send INVITE for %s", phone)
+            logger.error(f"[CALL] {call_id} Failed to send INVITE")
             await self._cleanup_call(call_id, send_lead=False)
             return None
         
@@ -588,33 +678,52 @@ class SIPWorker:
 
     async def handle_invite_challenge(self, msg, call_id, addr):
         session = self.sessions.get(call_id)
-        if not session or session["direction"] != "outbound": return
+        if not session or session["direction"] != "outbound":
+            return
+
+        msg_call_id = self._extract_header(msg, "Call-ID") or ""
+        if msg_call_id != call_id:
+            logger.warning(f"[SIP] INVITE challenge Call-ID mismatch: {msg_call_id} != {call_id}")
+            return
+
+        session["invite_auth_retries"] = session.get("invite_auth_retries", 0) + 1
+        if session["invite_auth_retries"] > 2:
+            logger.error(f"[CALL] {call_id} Max auth retries exceeded")
+            session["hangup_reason"] = "auth_retry_exceeded"
+            await self._cleanup_call(call_id, send_lead=False)
+            return
 
         auth_data, proxy = self._parse_auth_challenge(msg)
-        if not auth_data: return
+        if not auth_data:
+            logger.error(f"[CALL] {call_id} No auth data in 401/407")
+            return
 
         session["invite_cseq"] += 1
         session["via_branch"] = f"z9hG4bK{random.randint(100000,999999)}"
         session["auth_cache"] = auth_data
         session["auth_cache"]["_proxy"] = proxy
 
-        auth_header = self._compute_digest(auth_data, method="INVITE", uri=self._build_outbound_ruri(session["phone"]), proxy=proxy)
+        auth_header = self._compute_digest(auth_data, method="INVITE", 
+                                          uri=self._build_outbound_ruri(session["phone"]), proxy=proxy)
         invite = self._build_outbound_invite(session)
+        if not invite:
+            return
         lines = invite.split("\r\n")
         insert_idx = next((i for i, l in enumerate(lines) if l.startswith("Content-Length")), 0)
         lines.insert(insert_idx, auth_header)
         
-        logger.info("[SIP] Sending INVITE with Authorization cseq=%d", session["invite_cseq"])
+        logger.info(f"[CALL] {call_id} Sending authenticated INVITE cseq={session['invite_cseq']}")
         await self._send_sip_message("\r\n".join(lines), addr)
 
     async def handle_invite_200(self, msg, call_id, addr):
         session = self.sessions.get(call_id)
-        if not session or session["direction"] != "outbound": return
+        if not session or session["direction"] != "outbound":
+            return
 
         async with session.get("rtp_lock"):
             if session["state"] in ("STOPPING", "ENDING", "ENDED", "BYE_SENT"):
-                ack, _ = self._build_ack(session)
-                await self._send_sip_message(ack, addr)
+                ack, _ = self._build_ack(session, is_2xx=True)
+                await self._send_sip_message(ack, session.get("dialog_target") or addr)
                 await self._cleanup_call(call_id, send_lead=False)
                 return
 
@@ -622,6 +731,7 @@ class SIPWorker:
             m = re.search(r';tag=([^;\s]+)', to_hdr, re.IGNORECASE)
             to_tag = m.group(1) if m else None
             if not to_tag:
+                logger.error(f"[CALL] {call_id} No To-tag in 200 OK")
                 await self._cleanup_call(call_id, send_lead=False)
                 return
 
@@ -629,27 +739,44 @@ class SIPWorker:
             session["to_hdr"] = to_hdr
             contact = self._extract_header(msg, "Contact") or ""
             session["remote_contact"] = contact
+            logger.info(f"[CALL] {call_id} Contact: {contact}")
+            
+            contact_addr = parse_contact_address(contact)
+            session["dialog_target"] = contact_addr if contact_addr else addr
 
             remote_ip, remote_port, codec = self.parse_sdp_remote_media(msg)
-            if not remote_ip or not remote_port or codec not in (0, 8):
+            if not remote_ip or not remote_port:
+                logger.error(f"[CALL] {call_id} Invalid remote SDP")
+                await self._cleanup_call(call_id, send_lead=False)
+                return
+
+            if codec not in (0, 8):
+                logger.error(f"[CALL] {call_id} Unsupported codec: {codec}")
                 await self._cleanup_call(call_id, send_lead=False)
                 return
 
             session["remote_ip"] = remote_ip
             session["remote_port"] = remote_port
             session["negotiated_codec"] = codec
+            logger.info(f"[CALL] {call_id} Remote RTP: {remote_ip}:{remote_port}, codec={codec}")
 
             ack, _ = self._build_ack(session, contact, is_2xx=True)
-            logger.info("[SIP] Sending ACK")
-            await self._send_sip_message(ack, addr)
+            logger.info(f"[CALL] {call_id} Sending ACK")
+            await self._send_sip_message(ack, session.get("dialog_target") or addr)
 
             session["state"] = "ANSWERED"
             session["answered_at"] = time.time()
+            logger.info(f"[CALL] {call_id} 200 OK, ACK sent")
             await self._start_outbound_media(call_id, session)
 
     async def _start_outbound_media(self, call_id, session):
         bound_sock = session.get("rtp_bound_sock")
         if not bound_sock:
+            await self._cleanup_call(call_id, send_lead=False)
+            return
+
+        if session.get("negotiated_codec") not in (0, 8):
+            logger.error(f"[CALL] {call_id} Invalid negotiated codec: {session.get('negotiated_codec')}")
             await self._cleanup_call(call_id, send_lead=False)
             return
 
@@ -660,7 +787,7 @@ class SIPWorker:
                 sock=bound_sock,
             )
         except Exception as e:
-            logger.error("RTP endpoint creation failed: %s", e)
+            logger.error(f"[CALL] {call_id} RTP endpoint creation failed: {e}")
             await self._cleanup_call(call_id, send_lead=False)
             return
 
@@ -675,6 +802,7 @@ class SIPWorker:
         session["voice_engine_task"] = asyncio.create_task(self.voice_engine.start(call_id, session))
         session["media_watchdog_task"] = asyncio.create_task(self._media_idle_watchdog(call_id))
         session["max_duration_task"] = asyncio.create_task(self._max_call_duration_watchdog(call_id))
+        logger.info(f"[RTP] {call_id} RTP session started, codec={session['negotiated_codec']}")
 
     async def _keepalive_loop(self, session):
         while session.get("proto") and session["proto"].active and not session.get("stopped"):
@@ -685,28 +813,33 @@ class SIPWorker:
 
     async def _media_idle_watchdog(self, call_id: str):
         session = self.sessions.get(call_id)
-        if not session: return
+        if not session:
+            return
         while session.get("proto") and session["proto"].active and not session.get("stopped"):
             await asyncio.sleep(5)
             session = self.sessions.get(call_id)
-            if not session: return
+            if not session:
+                return
             proto = session.get("proto")
-            if not proto: return
+            if not proto:
+                return
             idle_time = time.monotonic() - proto.last_packet_time
             if idle_time > MEDIA_IDLE_TIMEOUT:
-                logger.warning("MEDIA_IDLE_TIMEOUT exceeded call_id=%s (%.1fs)", call_id, idle_time)
+                logger.warning(f"[CALL] {call_id} MEDIA_IDLE_TIMEOUT exceeded ({idle_time:.1f}s)")
                 session["hangup_reason"] = "media_idle_timeout"
                 await self._cleanup_call(call_id, send_lead=True)
                 return
 
     async def _max_call_duration_watchdog(self, call_id: str):
         session = self.sessions.get(call_id)
-        if not session: return
+        if not session:
+            return
         await asyncio.sleep(MAX_CALL_DURATION)
         session = self.sessions.get(call_id)
-        if not session: return
+        if not session:
+            return
         if session["state"] in ("IN_PROGRESS", "ANSWERED"):
-            logger.warning("MAX_CALL_DURATION exceeded call_id=%s (%ds)", call_id, MAX_CALL_DURATION)
+            logger.warning(f"[CALL] {call_id} MAX_CALL_DURATION exceeded ({MAX_CALL_DURATION}s)")
             session["hangup_reason"] = "max_call_duration"
             await self._cleanup_call(call_id, send_lead=True)
 
@@ -714,14 +847,18 @@ class SIPWorker:
         await asyncio.sleep(SIP_TIMER_B)
         session = self.sessions.get(call_id)
         if session and session["state"] in ("CREATED", "DIALING", "RINGING"):
+            logger.warning(f"[CALL] {call_id} Outbound timeout")
             session["hangup_reason"] = "timeout"
             await self.send_cancel(call_id)
 
     async def send_cancel(self, call_id):
         session = self.sessions.get(call_id)
-        if not session or session["state"] in ("CANCEL_SENT", "STOPPING", "BYE_SENT", "ENDED"): return
+        if not session or session["state"] in ("CANCEL_SENT", "STOPPING", "BYE_SENT", "ENDED"):
+            return
 
         ruri = self._build_outbound_ruri(session["phone"])
+        if not ruri:
+            return
         cancel = (
             f"CANCEL {ruri} SIP/2.0\r\n"
             f"Via: SIP/2.0/UDP {PUBLIC_IP}:{self.port};branch={session['via_branch']}\r\n"
@@ -731,50 +868,79 @@ class SIPWorker:
         )
         await self._send_sip_message(cancel, session.get("signaling_addr"))
         session["state"] = "CANCEL_SENT"
-        asyncio.create_task(self._cancel_timeout(call_id))
+        logger.info(f"[CALL] {call_id} CANCEL sent")
+        session["cancel_timeout_task"] = asyncio.create_task(self._cancel_timeout(call_id))
 
     async def _cancel_timeout(self, call_id):
         await asyncio.sleep(10)
         session = self.sessions.get(call_id)
         if session and session["state"] == "CANCEL_SENT":
+            logger.warning(f"[CALL] {call_id} CANCEL timeout, forcing cleanup")
             await self._cleanup_call(call_id, send_lead=False)
 
     async def handle_invite_487(self, msg, call_id, addr):
         session = self.sessions.get(call_id)
-        if not session: return
+        if not session:
+            return
+        
+        to_hdr = self._extract_header(msg, "To")
+        if to_hdr:
+            session["to_hdr"] = to_hdr
+            m = re.search(r';tag=([^;\s]+)', to_hdr, re.IGNORECASE)
+            if m:
+                session["to_tag"] = m.group(1)
+        
         ack, _ = self._build_ack(session, is_2xx=False)
-        await self._send_sip_message(ack, addr)
+        ack_target = addr or session.get("signaling_addr")
+        await self._send_sip_message(ack, ack_target)
+        logger.info(f"[CALL] {call_id} 487 Request Terminated, ACK sent")
         await self._cleanup_call(call_id, send_lead=False)
 
     async def handle_invite_error(self, msg, call_id, code, addr=None):
         session = self.sessions.get(call_id)
-        if not session: return
+        if not session:
+            return
+        
+        to_hdr = self._extract_header(msg, "To")
+        if to_hdr:
+            session["to_hdr"] = to_hdr
+            m = re.search(r';tag=([^;\s]+)', to_hdr, re.IGNORECASE)
+            if m:
+                session["to_tag"] = m.group(1)
+        
         session["sip_code"] = code
         session["hangup_reason"] = f"error_{code}"
         ack, _ = self._build_ack(session, is_2xx=False)
-        await self._send_sip_message(ack, addr)
+        ack_target = addr or session.get("signaling_addr")
+        await self._send_sip_message(ack, ack_target)
+        logger.info(f"[CALL] {call_id} Error {code}, ACK sent")
         await self._cleanup_call(call_id, send_lead=False)
 
-    def handle_ack(self, msg, addr): pass 
+    def handle_ack(self, msg, addr):
+        pass
 
     async def handle_bye(self, msg, addr):
         call_id = self._extract_header(msg, "Call-ID") or ""
         session = self.sessions.get(call_id)
-        if not session: return
+        if not session:
+            return
         resp = f"SIP/2.0 200 OK\r\nVia: {self._extract_header(msg, 'Via') or ''}\r\nFrom: {self._extract_header(msg, 'From') or ''}\r\nTo: {self._extract_header(msg, 'To') or ''}\r\nCall-ID: {call_id}\r\nCSeq: {self._extract_header(msg, 'CSeq') or ''}\r\nContent-Length: 0\r\n\r\n"
         await self._send_sip_message(resp, addr)
         session["hangup_reason"] = "remote_hangup"
+        logger.info(f"[CALL] {call_id} Remote BYE received")
         await self._cleanup_call(call_id, send_lead=True)
 
     async def handle_cancel(self, msg, addr):
         call_id = self._extract_header(msg, "Call-ID") or ""
         session = self.sessions.get(call_id)
-        if not session or session["state"] not in ("CREATED", "DIALING", "RINGING"): return
+        if not session or session["state"] not in ("CREATED", "DIALING", "RINGING"):
+            return
         ok = f"SIP/2.0 200 OK\r\nVia: {self._extract_header(msg, 'Via') or ''}\r\nFrom: {self._extract_header(msg, 'From') or ''}\r\nTo: {self._extract_header(msg, 'To') or ''}\r\nCall-ID: {call_id}\r\nCSeq: {self._extract_header(msg, 'CSeq') or ''}\r\nContent-Length: 0\r\n\r\n"
         await self._send_sip_message(ok, addr)
         req_term = f"SIP/2.0 487 Request Terminated\r\nVia: {self._extract_header(msg, 'Via') or ''}\r\nFrom: {self._extract_header(msg, 'From') or ''}\r\nTo: {session['to_hdr']}\r\nCall-ID: {call_id}\r\nCSeq: {session['invite_cseq']}\r\nContent-Length: 0\r\n\r\n"
         await self._send_sip_message(req_term, addr)
         session["hangup_reason"] = "remote_cancel"
+        logger.info(f"[CALL] {call_id} Remote CANCEL received")
         await self._cleanup_call(call_id, send_lead=False)
 
     def handle_options(self, msg, addr):
@@ -782,12 +948,21 @@ class SIPWorker:
         cseq = self._extract_header(msg, "CSeq") or "1 OPTIONS"
         from_hdr = self._extract_header(msg, "From") or ""
         to_hdr = self._extract_header(msg, "To") or ""
-        if ";tag=" not in to_hdr.lower(): to_hdr = f"{to_hdr};tag={random.randint(1000,9999)}"
+        if ";tag=" not in to_hdr.lower():
+            to_hdr = f"{to_hdr};tag={random.randint(1000,9999)}"
         response = f"SIP/2.0 200 OK\r\nVia: {self._extract_header(msg, 'Via') or ''}\r\nFrom: {from_hdr}\r\nTo: {to_hdr}\r\nCall-ID: {call_id}\r\nCSeq: {cseq}\r\nContact: <sip:{self.user}@{PUBLIC_IP}:{self.port}>\r\nAllow: INVITE, ACK, BYE, CANCEL, OPTIONS\r\nContent-Length: 0\r\n\r\n"
         asyncio.create_task(self._send_sip_message(response, addr))
 
     async def send_bye(self, session):
+        addr = session.get("dialog_target") or session.get("signaling_addr")
+        if not addr or not self.sip_transport:
+            logger.error(f"[CALL] {session['call_id']} Cannot send BYE: no target address")
+            return False
+        
         uri = parse_contact_uri(session.get("remote_contact")) or self._build_outbound_ruri(session["phone"])
+        if not uri:
+            uri = f"sip:{session['phone']}@{self.host}"
+        
         new_branch = f"z9hG4bK{random.randint(100000,999999)}"
         from_hdr = session["from_hdr"] if session["direction"] == "outbound" else session["to_hdr"]
         to_hdr = session["to_hdr"] if session["direction"] == "outbound" else session["from_hdr"]
@@ -799,22 +974,60 @@ class SIPWorker:
             f"From: {from_hdr}\r\nTo: {to_hdr}\r\nCall-ID: {session['call_id']}\r\n"
             f"CSeq: {session['bye_cseq']} BYE\r\nMax-Forwards: 70\r\nContent-Length: 0\r\n\r\n"
         )
+        self.pending_byes[session["call_id"]] = {
+            "addr": addr, "uri": uri, "cseq": session["bye_cseq"],
+            "from_hdr": from_hdr, "to_hdr": to_hdr,
+        }
         session["bye_cseq"] += 1
         session["state"] = "BYE_SENT"
-        await self._send_sip_message(bye, session.get("signaling_addr"))
+        
+        if not await self._send_sip_message(bye, addr):
+            logger.error(f"[CALL] {session['call_id']} Failed to send BYE, fallback cleanup")
+            await self._cleanup_call(session["call_id"], send_lead=True)
+            return False
+        
+        logger.info(f"[CALL] {session['call_id']} BYE sent")
         session["bye_timeout_task"] = asyncio.create_task(self._bye_timeout(session["call_id"]))
+        return True
+
+    async def handle_bye_challenge(self, msg, call_id):
+        pending = self.pending_byes.get(call_id)
+        if not pending:
+            return
+        auth_data, proxy = self._parse_auth_challenge(msg)
+        if not auth_data:
+            logger.error(f"[CALL] {call_id} 401/407 on BYE, failed to parse challenge")
+            return
+        auth_header = self._compute_digest(auth_data, method="BYE", uri=pending["uri"], proxy=proxy)
+        self.pending_byes.pop(call_id, None)
+        branch = f"z9hG4bK{random.randint(100000,999999)}"
+        bye = (
+            f"BYE {pending['uri']} SIP/2.0\r\n"
+            f"Via: SIP/2.0/UDP {PUBLIC_IP}:{self.port};branch={branch}\r\n"
+            f"From: {pending['from_hdr']}\r\n"
+            f"To: {pending['to_hdr']}\r\n"
+            f"Call-ID: {call_id}\r\n"
+            f"CSeq: {pending['cseq']} BYE\r\n"
+            f"{auth_header}\r\n"
+            f"Max-Forwards: 70\r\nContent-Length: 0\r\n\r\n"
+        )
+        logger.info(f"[CALL] {call_id} Retrying BYE with digest authorization")
+        await self._send_sip_message(bye, pending["addr"])
 
     async def _bye_timeout(self, call_id):
         await asyncio.sleep(5)
         session = self.sessions.get(call_id)
         if session and session["state"] == "BYE_SENT":
+            logger.warning(f"[CALL] {call_id} BYE timeout, forcing cleanup")
             await self._cleanup_call(call_id, send_lead=True)
 
     async def terminate_call(self, call_id):
         session = self.sessions.get(call_id)
-        if not session or session.get("stopped"): return False
+        if not session or session.get("stopped"):
+            return False
         async with session.get("terminate_lock"):
-            if session.get("stopped"): return False
+            if session.get("stopped"):
+                return False
             if session["state"] in ("CREATED", "DIALING", "RINGING", "CANCEL_SENT"):
                 session["hangup_reason"] = "telegram_terminate"
                 await self.send_cancel(call_id)
@@ -827,46 +1040,78 @@ class SIPWorker:
 
     async def _start_bye(self, call_id, session):
         session["state"] = "STOPPING"
-        session["stopped"] = True
         for key in ("voice_engine_task", "keepalive_task", "timeout_task", "media_watchdog_task", "max_duration_task"):
-            if session.get(key): session[key].cancel()
-        await self.send_bye(session)
+            task = session.get(key)
+            if task and not task.done():
+                task.cancel()
+        success = await self.send_bye(session)
+        if not success:
+            logger.warning(f"[CALL] {call_id} BYE failed, cleanup will handle fallback")
 
     async def _cleanup_call(self, call_id, send_lead=True):
         session = self.sessions.get(call_id)
-        if not session or session.get("cleanup_state", 0) >= CLEANUP_STATES["STARTED"]: return
-        session["cleanup_state"] = CLEANUP_STATES["STARTED"]
-
-        for key in ("voice_engine_task", "timeout_task", "keepalive_task", "bye_timeout_task", "cancel_timeout_task", "media_watchdog_task", "max_duration_task"):
-            if session.get(key): session[key].cancel()
-
-        if session.get("proto"): session["proto"].active = False
-        if session.get("rtp_transport"): 
-            try: session["rtp_transport"].close()
-            except: pass
-        if session.get("rtp_bound_sock"):
-            try: session["rtp_bound_sock"].close()
-            except: pass
+        if not session:
+            return
+        if session.get("cleanup_state", 0) >= CLEANUP_STATES["STARTED"]:
+            return
         
-        self.release_port(session["rtp_port"])
-        session["cleanup_state"] = CLEANUP_STATES["RESOURCES_CLOSED"]
-
+        current_task = asyncio.current_task()
+        
+        session["cleanup_state"] = CLEANUP_STATES["STARTED"]
         try:
-            await self.database.set_call_ended(call_id, session.get("hangup_reason", "unknown"))
-        except Exception as e:
-            logger.error("DB update error: %s", e)
+            for key in ("voice_engine_task", "timeout_task", "keepalive_task", "bye_timeout_task", 
+                        "cancel_timeout_task", "media_watchdog_task", "max_duration_task"):
+                task = session.get(key)
+                if task is not None and task is not current_task and not task.done():
+                    task.cancel()
 
-        if send_lead and not session.get("_lead_sent"):
-            session["_lead_sent"] = True
+            if session.get("proto"):
+                session["proto"].active = False
+            if session.get("rtp_transport"):
+                try:
+                    session["rtp_transport"].close()
+                except:
+                    pass
+            if session.get("rtp_bound_sock"):
+                try:
+                    session["rtp_bound_sock"].close()
+                except:
+                    pass
+            
+            self.release_port(session["rtp_port"])
+            session["cleanup_state"] = CLEANUP_STATES["RESOURCES_CLOSED"]
+
             try:
-                if self.voice_engine: await self.voice_engine.finish_call(call_id, session)
+                await self.database.set_call_ended(call_id, session.get("hangup_reason", "unknown"))
             except Exception as e:
-                logger.error("finish_call error: %s", e)
+                logger.error(f"[CALL] {call_id} DB update error: {e}")
 
-        session["state"] = "ENDED"
-        session["stopped"] = True
-        session["cleanup_state"] = CLEANUP_STATES["COMPLETED"]
-        self.sessions.pop(call_id, None)
+            if send_lead and not session.get("_lead_sent"):
+                session["_lead_sent"] = True
+                try:
+                    if self.voice_engine:
+                        await self.voice_engine.finish_call(call_id, session)
+                except Exception as e:
+                    logger.error(f"[CALL] {call_id} finish_call error: {e}")
+
+            session["state"] = "ENDED"
+            session["stopped"] = True
+            session["cleanup_state"] = CLEANUP_STATES["COMPLETED"]
+            self.pending_byes.pop(call_id, None)
+            self.sessions.pop(call_id, None)
+            logger.info(f"[CLEANUP] {call_id} completed")
+        except asyncio.CancelledError:
+            logger.warning(f"[CLEANUP] {call_id} was cancelled, ensuring resources released")
+            if session.get("rtp_bound_sock"):
+                try:
+                    session["rtp_bound_sock"].close()
+                except:
+                    pass
+            self.release_port(session["rtp_port"])
+            session["cleanup_state"] = CLEANUP_STATES["COMPLETED"]
+            self.pending_byes.pop(call_id, None)
+            self.sessions.pop(call_id, None)
+            raise
 
     def get_active_calls(self):
         return {k: v for k, v in self.sessions.items() if not v.get("stopped")}
@@ -888,7 +1133,7 @@ class SIPWorker:
                 local_addr=('0.0.0.0', self.port)
             )
             self.sip_transport = transport
-            logger.info("[SIP] UDP socket bound successfully. Waiting for connection_made callback...")
+            logger.info("[SIP] UDP socket bound successfully.")
         except Exception as e:
             logger.error("[SIP] CRITICAL: Failed to bind UDP transport: %s", e)
             raise
@@ -900,12 +1145,15 @@ class SIPWorker:
     async def _heartbeat_loop(self):
         while self.is_running:
             try:
-                with open(HEARTBEAT_FILE, "w") as f: f.write(str(time.time()))
-            except Exception: pass
+                with open(HEARTBEAT_FILE, "w") as f:
+                    f.write(str(time.time()))
+            except Exception:
+                pass
             await asyncio.sleep(HEARTBEAT_INTERVAL)
 
     async def graceful_stop(self):
-        if not self.is_running: return
+        if not self.is_running:
+            return
         self.is_running = False
         for call_id in list(self.sessions.keys()):
             session = self.sessions.get(call_id)
@@ -915,5 +1163,7 @@ class SIPWorker:
                 await self._cleanup_call(call_id, send_lead=False)
         await asyncio.sleep(2)
         for task in (self._refresh_task, self._heartbeat_task):
-            if task: task.cancel()
-        if self.sip_transport: self.sip_transport.close()
+            if task:
+                task.cancel()
+        if self.sip_transport:
+            self.sip_transport.close()
