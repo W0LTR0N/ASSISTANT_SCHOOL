@@ -1,10 +1,9 @@
+version: '3.8'
+
 services:
   app:
     build: .
     env_file: .env
-    # УБРАНЫ прокси-переменные из environment!
-    # Telegram бот использует свой прокси через AiohttpSession
-    # HTTP клиент в integrations.py настроен отдельно
     ports:
       - "5060:5060/tcp"
       - "10000-10100:10000-10100/udp"
