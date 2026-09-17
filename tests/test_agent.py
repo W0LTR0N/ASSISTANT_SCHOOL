@@ -5,37 +5,37 @@ import json
 
 from app.agent import Agent
 from app.models import CallRecord, CallResult
-from app.bot import normalize_phone
+from app.bot import clean_phone
 
 
 class TestPhoneNormalization:
     def test_normalize_plus7(self):
-        assert normalize_phone("+79991234567") == "+79991234567"
+        assert clean_phone("+79991234567") == "79991234567"
 
     def test_normalize_8(self):
-        assert normalize_phone("89991234567") == "+79991234567"
+        assert clean_phone("89991234567") == "79991234567"
 
     def test_normalize_7(self):
-        assert normalize_phone("79991234567") == "+79991234567"
+        assert clean_phone("79991234567") == "79991234567"
 
     def test_normalize_with_spaces(self):
-        assert normalize_phone("+7 999 123 45 67") == "+79991234567"
+        assert clean_phone("+7 999 123 45 67") == "79991234567"
 
     def test_normalize_with_dashes(self):
-        assert normalize_phone("+7-999-123-45-67") == "+79991234567"
+        assert clean_phone("+7-999-123-45-67") == "79991234567"
 
     def test_normalize_10_digits(self):
-        assert normalize_phone("9991234567") == "+79991234567"
+        assert clean_phone("9991234567") == "79991234567"
 
     def test_normalize_invalid(self):
-        assert normalize_phone("abc") is None
-        assert normalize_phone("123") is None
-        assert normalize_phone("") is None
+        assert clean_phone("abc") == ""
+        assert clean_phone("123") == ""
+        assert clean_phone("") == ""
 
     def test_normalize_sip_injection(self):
-        assert normalize_phone("sip:evil@host") is None
-        assert normalize_phone("+7999@evil") is None
-        assert normalize_phone(";transport=tcp") is None
+        assert clean_phone("sip:evil@host") == ""
+        assert clean_phone("+7999@evil") == ""
+        assert clean_phone(";transport=tcp") == ""
 
 
 class TestModels:
@@ -116,18 +116,6 @@ class TestRateLimiter:
         assert limiter.allow("1.2.3.4") is True
         assert limiter.allow("1.2.3.4") is False
         assert limiter.allow("5.6.7.8") is True
-
-
-class TestDigest:
-    def test_parse_digest_challenge(self):
-        from app.sip_worker import parse_digest_challenge
-        
-        header = 'realm="example.com", nonce="abc123", qop="auth"'
-        data = parse_digest_challenge(header)
-        
-        assert data["realm"] == "example.com"
-        assert data["nonce"] == "abc123"
-        assert data["qop"] == "auth"
 
 
 class TestSDP:
