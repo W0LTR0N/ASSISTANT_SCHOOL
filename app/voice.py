@@ -47,7 +47,8 @@ class VoiceEngine:
     async def _send_greeting(self, call_id: str, session) -> None:
         try:
             scenario = session.get("scenario", "BEFORE_LESSON")
-            greeting = await self.agent.get_greeting(call_id, scenario)
+            # 🔥 ПЕРЕДАЕМ METADATA В AGENT ДЛЯ ПЕРСОНАЛИЗИРОВАННОГО ПРИВЕТСТВИЯ
+            greeting = await self.agent.get_greeting(call_id, scenario, metadata=session.get("metadata"))
             if not greeting:
                 return
 
@@ -110,10 +111,10 @@ class VoiceEngine:
                         session["preroll_buffer"].extend(pcm_data)
                     else:
                         session["preroll_buffer"] = session["preroll_buffer"][-preroll_bytes:]
-                    
+
                     session["speech_buffer"].extend(pcm_data)
                     session["silence_start"] = None
-                    
+
                     if session["speech_start"] is None:
                         session["speech_start"] = time.monotonic()
 
@@ -168,8 +169,9 @@ class VoiceEngine:
             await self.database.add_transcript(call_id, "user", text)
 
             scenario = session.get("scenario", "BEFORE_LESSON")
-            agent_response = await self.agent.process_user_message(call_id, text, scenario)
-            
+            # 🔥 ПЕРЕДАЕМ METADATA В AGENT ДЛЯ УЧЁТА КОНТЕКСТА (ИМЯ, ПРЕДМЕТ, КЛАСС И Т.Д.)
+            agent_response = await self.agent.process_user_message(call_id, text, scenario, metadata=session.get("metadata"))
+
             if not agent_response:
                 fallback = "Секунду, я уточню информацию."
                 await self.database.add_transcript(call_id, "assistant", fallback)
