@@ -1,5 +1,6 @@
 """
 Работа с базой данных проекта WOLTRON Voice AI.
+
 SQLite через aiosqlite.
 
 Исправления:
@@ -57,21 +58,20 @@ class Database:
             raise
 
         await self._migrate()
-        
         logger.info("Database initialized at %s", self.db_path)
         await self._reconcile_orphan_calls()
 
     async def _migrate(self) -> None:
         """Простая migration mechanism."""
         conn = self._require_connected()
-        
+
         try:
             async with conn.execute("SELECT value FROM metadata WHERE key='schema_version'") as cursor:
                 row = await cursor.fetchone()
                 current_version = int(row[0]) if row else 0
         except aiosqlite.OperationalError:
             current_version = 0
-        
+
         if current_version < 1:
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS calls (
@@ -88,6 +88,7 @@ class Database:
                     hangup_reason TEXT
                 )
             """)
+
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS transcripts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -98,10 +99,12 @@ class Database:
                     FOREIGN KEY (call_id) REFERENCES calls(id)
                 )
             """)
+
             await conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_transcripts_call_id
                 ON transcripts(call_id)
             """)
+
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS call_results (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -116,25 +119,29 @@ class Database:
                     FOREIGN KEY (call_id) REFERENCES calls(id)
                 )
             """)
+
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS metadata (
                     key TEXT PRIMARY KEY,
                     value TEXT
                 )
             """)
+
             await conn.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', '1')")
             await conn.commit()
             logger.info("Database migrated to version 1")
-        
+
         if current_version < 2:
             await conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_call_results_delivery
                 ON call_results(albato_status, telegram_status, next_delivery_retry_at)
             """)
+
             await conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_calls_status
                 ON calls(status)
             """)
+
             await conn.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', '2')")
             await conn.commit()
             logger.info("Database migrated to version 2")
@@ -143,11 +150,11 @@ class Database:
         conn = self._require_connected()
         orphan_statuses = ("DIALING", "RINGING", "ANSWERED", "IN_PROGRESS")
         placeholders = ",".join("?" * len(orphan_statuses))
-        
+
         try:
             await conn.execute(
                 f"""
-                UPDATE calls 
+                UPDATE calls
                 SET status = 'CRASHED', hangup_reason = 'server_restart', ended_at = CURRENT_TIMESTAMP
                 WHERE status IN ({placeholders})
                 """,
@@ -166,41 +173,39 @@ class Database:
                 logger.error("Error closing database: %s", e)
             finally:
                 self.conn = None
-            logger.info("Database connection closed")
+                logger.info("Database connection closed")
 
     async def create_call(
-        self, 
-        call_id: str, 
-        direction: str, 
-        scenario: str, 
+        self,
+        call_id: str,
+        direction: str,
+        scenario: str,
         phone: str,
         metadata: Optional[str] = None,
     ) -> None:
         conn = self._require_connected()
-        
         if scenario not in ("BEFORE_LESSON", "AFTER_LESSON"):
             logger.warning("Invalid scenario %s, defaulting to BEFORE_LESSON", scenario)
             scenario = "BEFORE_LESSON"
-        
+
         await conn.execute(
             """
-            INSERT INTO calls (id, direction, scenario, phone, metadata) 
+            INSERT INTO calls (id, direction, scenario, phone, metadata)
             VALUES (?, ?, ?, ?, ?)
             """,
             (call_id, direction, scenario, phone, metadata),
         )
         await conn.commit()
-        logger.info("Call created: %s (direction=%s, scenario=%s, phone=%s)", 
-                   call_id, direction, scenario, phone[:8] + "***")
+        logger.info("Call created: %s (direction=%s, scenario=%s, phone=%s)",
+                     call_id, direction, scenario, phone[:8] + "***")
 
     async def update_call_status(
-        self, 
-        call_id: str, 
+        self,
+        call_id: str,
         status: str,
         hangup_reason: Optional[str] = None,
     ) -> None:
         conn = self._require_connected()
-        
         valid_statuses = (
             "CREATED", "DIALING", "RINGING", "ANSWERED", "IN_PROGRESS",
             "ENDED", "FAILED", "NO_ANSWER", "BUSY", "REJECTED",
@@ -208,7 +213,7 @@ class Database:
         )
         if status not in valid_statuses:
             logger.warning("Invalid status %s for call %s", status, call_id)
-        
+
         if hangup_reason:
             await conn.execute(
                 "UPDATE calls SET status = ?, hangup_reason = ? WHERE id = ?",
@@ -241,7 +246,7 @@ class Database:
         conn = self._require_connected()
         await conn.execute(
             """
-            UPDATE calls 
+            UPDATE calls
             SET ended_at = CURRENT_TIMESTAMP, status = 'ENDED', hangup_reason = ?
             WHERE id = ?
             """,
@@ -325,25 +330,26 @@ class Database:
         delivery_error: Optional[str] = None,
     ) -> None:
         conn = self._require_connected()
-        
         updates = []
         params = []
-        
+
         if albato_status:
             updates.append("albato_status = ?")
             params.append(albato_status)
+
         if telegram_status:
             updates.append("telegram_status = ?")
             params.append(telegram_status)
+
         if delivery_error:
             updates.append("last_delivery_error = ?")
             updates.append("delivery_retry_count = delivery_retry_count + 1")
             updates.append("next_delivery_retry_at = datetime('now', '+1 minute')")
             params.append(delivery_error)
-        
+
         if not updates:
             return
-        
+
         params.append(call_id)
         await conn.execute(
             f"UPDATE call_results SET {', '.join(updates)} WHERE call_id = ?",
@@ -368,7 +374,7 @@ class Database:
                    cr.delivery_retry_count
             FROM call_results cr
             WHERE (cr.albato_status = 'pending' OR cr.telegram_status = 'pending')
-              AND (cr.next_delivery_retry_at IS NULL 
+              AND (cr.next_delivery_retry_at IS NULL
                    OR cr.next_delivery_retry_at <= datetime('now'))
               AND cr.delivery_retry_count < 5
             LIMIT ?
@@ -386,3 +392,21 @@ class Database:
                 }
                 for r in rows
             ]
+
+    async def get_recent_calls(self, limit: int = 10) -> List[dict]:
+        """Получение последних звонков для истории."""
+        conn = self._require_connected()
+        async with conn.execute(
+            "SELECT id, scenario, phone, status, metadata, started_at, ended_at FROM calls ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [{
+                "id": r[0],
+                "scenario": r[1],
+                "phone": r[2],
+                "status": r[3],
+                "metadata": r[4],
+                "started_at": r[5],
+                "ended_at": r[6]
+            } for r in rows]
