@@ -72,6 +72,7 @@ class Agent:
             scenario_prompt = await self._load_prompt(scenario.lower())
             context_info = await self._get_context_info(call_id)
 
+            # 🔥 ИСПРАВЛЕНО: Контекст идёт СРАЗУ ПОСЛЕ system_prompt, ПЕРЕД scenario_prompt
             full_system_prompt = system_prompt + context_info + ("\n\n" + scenario_prompt if scenario_prompt else "")
 
             history = await self.database.get_conversation_history(call_id, max_messages=MAX_HISTORY_MESSAGES)
@@ -99,6 +100,7 @@ class Agent:
             scenario_prompt = await self._load_prompt(scenario.lower())
             context_info = await self._get_context_info(call_id)
 
+            # 🔥 ИСПРАВЛЕНО: Контекст идёт СРАЗУ ПОСЛЕ system_prompt, ПЕРЕД scenario_prompt
             full_system_prompt = system_prompt + context_info + ("\n\n" + scenario_prompt if scenario_prompt else "")
 
             messages = [
@@ -108,9 +110,8 @@ class Agent:
             response = await self.integrations.agent_chat(call_id, messages, max_tokens=100)
             greeting = response or "Здравствуйте! Чем могу помочь?"
 
-            # ВАЖНО: НЕ сохраняем greeting здесь!
-            # Вызывающий код (voice.py) уже сохраняет его через add_transcript()
-            # Это предотвращает дублирование записи.
+            # Обрезаем приветствие тоже (на случай если LLM разойдётся)
+            greeting = self._truncate_response(greeting)
 
             return greeting
         except Exception as e:
