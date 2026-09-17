@@ -9,11 +9,39 @@ logger = logging.getLogger("agent")
 MAX_HISTORY_MESSAGES = 20
 MAX_RESPONSE_LENGTH = 200
 
-
 class Agent:
     def __init__(self, integrations, database):
         self.integrations = integrations
         self.database = database
+
+    async def _get_context_info(self, call_id: str) -> str:
+        """Загружает metadata из БД и формирует контекст для промпта."""
+        context_info = ""
+        try:
+            call_record = await self.database.get_call(call_id)
+            if call_record and call_record.metadata:
+                meta = json.loads(call_record.metadata)
+                context_info = "\n\nКОНТЕКСТ ЗВОНКА:\n"
+                if meta.get('contact_type') == 'parent':
+                    context_info += f"- Собеседник: Родитель ({meta.get('name', 'Не указано')})\n"
+                    context_info += f"- Ученик: {meta.get('student_name', 'Не указано')}\n"
+                else:
+                    context_info += f"- Собеседник: Ученик ({meta.get('name', 'Не указано')})\n"
+                if meta.get('subject'):
+                    context_info += f"- Предмет: {meta.get('subject')}\n"
+                if meta.get('class_level'):
+                    context_info += f"- Класс: {meta.get('class_level')}\n"
+                if meta.get('goal'):
+                    context_info += f"- Цель: {meta.get('goal')}\n"
+                if meta.get('extra_context'):
+                    context_info += f"- Дополнительно: {meta.get('extra_context')}\n"
+                if meta.get('lesson_result'):
+                    context_info += f"- Результат пробного урока: {meta.get('lesson_result')}\n"
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.error("JSON decode error loading context for call_id=%s: %s", call_id, e)
+        except Exception as e:
+            logger.error("Error loading context for call_id=%s: %s", call_id, e)
+        return context_info
 
     async def process_user_message(self, call_id: str, user_text: str, scenario: str) -> str:
         try:
@@ -22,8 +50,11 @@ class Agent:
 
             system_prompt = await self._load_prompt("system")
             scenario_prompt = await self._load_prompt(scenario.lower())
-            full_system_prompt = system_prompt + ("\n\n" + scenario_prompt if scenario_prompt else "")
-
+            
+            context_info = await self._get_context_info(call_id)
+            
+            full_system_prompt = system_prompt + context_info + ("\n\n" + scenario_prompt if scenario_prompt else "")
+            
             history = await self.database.get_conversation_history(call_id, max_messages=MAX_HISTORY_MESSAGES)
 
             messages = [{"role": "system", "content": full_system_prompt}]
@@ -48,7 +79,10 @@ class Agent:
 
             system_prompt = await self._load_prompt("system")
             scenario_prompt = await self._load_prompt(scenario.lower())
-            full_system_prompt = system_prompt + ("\n\n" + scenario_prompt if scenario_prompt else "")
+            
+            context_info = await self._get_context_info(call_id)
+            
+            full_system_prompt = system_prompt + context_info + ("\n\n" + scenario_prompt if scenario_prompt else "")
 
             messages = [
                 {"role": "system", "content": full_system_prompt},
@@ -70,6 +104,7 @@ class Agent:
 
             summary_prompt = await self._load_prompt("summary")
             relevant_transcripts = transcripts[-30:] if len(transcripts) > 30 else transcripts
+            
             transcript_text = "\n".join(f"{t['role']}: {t['text']}" for t in relevant_transcripts)
             if len(transcript_text) > 5000:
                 transcript_text = transcript_text[-5000:]
@@ -81,7 +116,7 @@ class Agent:
             response = await self.integrations.agent_chat(call_id, messages, max_tokens=500)
 
             try:
-                clean_response = response.strip()
+                clean_response = response.strip() if response else ""
                 if clean_response.startswith("```"):
                     parts = clean_response.split("```")
                     if len(parts) >= 2:
@@ -97,11 +132,11 @@ class Agent:
                 if result.get("summary") and len(result["summary"]) > 200:
                     result["summary"] = result["summary"][:200].rsplit(' ', 1)[0] + "..."
                 return result
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, AttributeError):
                 return {
                     "name": None, "interest": "unknown", "lesson_status": "unknown",
                     "next_step": None, "objections": None,
-                    "summary": response[:200] if response else "Не удалось сгенерировать резюме.",
+                    "summary": (response[:200] if response else "Не удалось сгенерировать резюме."),
                 }
         except Exception as e:
             logger.error("generate_summary error call_id=%s: %s", call_id, e)
