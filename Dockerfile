@@ -19,7 +19,7 @@ RUN mkdir -p /app/data && chown -R woltron:woltron /app/data
 
 USER woltron
 
-EXPOSE 5060/udp
+EXPOSE 5060/tcp
 EXPOSE 10000-10100/udp
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
