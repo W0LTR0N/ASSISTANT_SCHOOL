@@ -118,6 +118,18 @@ class TestRateLimiter:
         assert limiter.allow("5.6.7.8") is True
 
 
+class TestDigest:
+    def test_parse_digest_challenge(self):
+        from app.sip_worker import parse_digest_params
+        
+        header = 'realm="example.com", nonce="abc123", qop="auth"'
+        data = parse_digest_params(header)
+        
+        assert data["realm"] == "example.com"
+        assert data["nonce"] == "abc123"
+        assert data["qop"] == "auth"
+
+
 class TestSDP:
     def test_parse_sdp(self):
         from app.sip_worker import SIPWorker
