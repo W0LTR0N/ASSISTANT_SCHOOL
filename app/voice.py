@@ -47,8 +47,8 @@ class VoiceEngine:
     async def _send_greeting(self, call_id: str, session) -> None:
         try:
             scenario = session.get("scenario", "BEFORE_LESSON")
-            # 🔥 ПЕРЕДАЕМ METADATA В AGENT ДЛЯ ПЕРСОНАЛИЗИРОВАННОГО ПРИВЕТСТВИЯ
-            greeting = await self.agent.get_greeting(call_id, scenario, metadata=session.get("metadata"))
+            # Agent сам загружает metadata звонка из БД (_get_context_info)
+            greeting = await self.agent.get_greeting(call_id, scenario)
             if not greeting:
                 return
 
@@ -169,8 +169,8 @@ class VoiceEngine:
             await self.database.add_transcript(call_id, "user", text)
 
             scenario = session.get("scenario", "BEFORE_LESSON")
-            # 🔥 ПЕРЕДАЕМ METADATA В AGENT ДЛЯ УЧЁТА КОНТЕКСТА (ИМЯ, ПРЕДМЕТ, КЛАСС И Т.Д.)
-            agent_response = await self.agent.process_user_message(call_id, text, scenario, metadata=session.get("metadata"))
+            # Agent сам загружает metadata звонка из БД (_get_context_info)
+            agent_response = await self.agent.process_user_message(call_id, text, scenario)
 
             if not agent_response:
                 fallback = "Секунду, я уточню информацию."
@@ -200,7 +200,7 @@ class VoiceEngine:
         for i in range(samples):
             sample = int.from_bytes(pcm_data[i * 2:i * 2 + 2], byteorder="little", signed=True)
             total += sample * sample
-        return (total / samples) ** 0.5
+        return total / samples
 
     async def finish_call(self, call_id: str, session) -> None:
         logger.info("Finishing call call_id=%s", call_id)
