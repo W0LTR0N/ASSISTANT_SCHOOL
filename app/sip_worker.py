@@ -416,6 +416,7 @@ class SIPWorker:
         session_ip = media_ip = None
         port = None
         in_media = False
+        inactive = False
         codecs = []
         for line in msg.splitlines():
             if line.startswith("c=IN IP4"):
@@ -437,7 +438,9 @@ class SIPWorker:
                             codecs.append(pt)
                     except ValueError:
                         pass
-        if port is None or not codecs:
+            elif in_media and line.startswith("a=inactive"):
+                inactive = True
+        if port is None or not codecs or inactive or port == 0:
             return None, None, None
         codec = 8 if 8 in codecs else (0 if 0 in codecs else codecs[0])
         return (media_ip or session_ip), port, codec
@@ -1188,7 +1191,7 @@ class SIPWorker:
                 task.cancel()
         await self.send_bye(session)
 
-    # ─── Cleanup ────────────────────────────────────────────────────────
+    # ─── Cleanup ───────────────────────────────────────────────────────
 
     async def _cleanup_call(self, call_id: str, send_lead: bool = True):
         session = self.sessions.get(call_id)
