@@ -61,7 +61,7 @@ class CallResult:
     interest: Optional[str] = None
     lesson_status: Optional[str] = None
     next_step: Optional[str] = None
-    objections: Optional[str] = None
+    objections: Optional[List[str]] = None
     summary: Optional[str] = None
     transcript: Optional[str] = None
 
